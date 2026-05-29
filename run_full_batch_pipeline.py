@@ -33,7 +33,7 @@ from typing import Any, Iterable
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CODE_DIR = SCRIPT_DIR / "code"
+CODE_DIR = SCRIPT_DIR / "scripts"
 if CODE_DIR.exists():
     sys.path.insert(0, str(CODE_DIR))
 if str(SCRIPT_DIR) not in sys.path:
@@ -205,8 +205,8 @@ class WhisperXWorker:
         import re as _re  # noqa: PLC0415
         import tempfile  # noqa: PLC0415
         import whisperx  # noqa: PLC0415
-        from whisperX_code.align import extract_audio, SAMPLE_RATE  # noqa: PLC0415
-        from whisperX_code.json_to_ass import group_words, build_dialogue, ASS_HEADER  # noqa: PLC0415
+        from whisperX_scripts.align import extract_audio, SAMPLE_RATE  # noqa: PLC0415
+        from whisperX_scripts.json_to_ass import group_words, build_dialogue, ASS_HEADER  # noqa: PLC0415
 
         metrics = {"model_load_s": 0.0, "audio_extract_s": 0.0, "transcribe_s": 0.0, "write_s": 0.0}
         metrics["model_load_s"] = self._ensure_loaded()
