@@ -881,14 +881,14 @@ def call_image_picker_api(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise ApiCallError(api_url, payload_str, f"HTTP {exc.code} {exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise ApiCallError(api_url, payload_str, f"URLError: {exc.reason}") from exc
     except TimeoutError:
-        raise ApiCallError(api_url, payload_str, "timeout after 30s") from None
+        raise ApiCallError(api_url, payload_str, "timeout after 60s") from None
     except Exception as exc:  # noqa: BLE001
         raise ApiCallError(api_url, payload_str, f"{type(exc).__name__}: {exc}") from exc
 
