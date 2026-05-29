@@ -1,0 +1,503 @@
+{
+  "output": {
+    "width": 720,
+    "height": 960,
+    "fps": 30,
+    "pix_fmt": "yuv420p",
+    "sample_rate": 48000
+  },
+  "subtitle_style": {
+    "font": "Montserrat SemiBold",
+    "font_size": 56,
+    "primary_color": "&H00E5FF&",
+    "secondary_color": "&H00FFFFFF",
+    "outline": 0,
+    "shadow": 2,
+    "back_color": "&H00000000"
+  },
+  "scene_type_presets": {
+    "talking_head_scene": {
+      "description": "Talking head full screen. Product image is not required."
+    },
+    "product_scene": {
+      "layout": "product_top_2_3_data_bottom_1_3",
+      "talking_head": "hidden"
+    },
+    "talking_head_product_strip_scene": {
+      "layout": "talking_head_with_product_data_strip",
+      "talking_head": "full_screen",
+      "product_image": "bottom_right_badge",
+      "description": "Talking head full screen with a black product data strip and product image badge."
+    },
+    "product_pip_intro_scene": {
+      "layout": "product_fullscreen_hero_image",
+      "talking_head": "pip",
+      "product_image": "fullscreen_hero",
+      "description": "Product image hero scene with talking-head PiP and no product detail strip."
+    },
+    "pip_talking_head_no_effect": {
+      "layout": "product_fullscreen_hero_image",
+      "talking_head": "pip",
+      "product_image": "fullscreen_hero",
+      "description": "Static product hero image with talking-head PiP. No zoom or animation effects."
+    },
+    "product_bridge_scene": {
+      "layout": "product_top_2_3_data_bottom_1_3",
+      "talking_head": "hidden",
+      "audio": "silent",
+      "duration": 3.0,
+      "transition": "dip_to_white",
+      "description": "Silent product-only bridge between talking-head video segments."
+    },
+    "product_bridge_gradient_overlay": {
+      "layout": "product_top_2_3_data_bottom_1_3",
+      "talking_head": "hidden",
+      "audio": "silent",
+      "duration": 3.0,
+      "transition": "dip_to_white",
+      "description": "Product bridge scene with gradient overlay and bridge overlay points."
+    },
+    "product_highlight_pip_scene": {
+      "layout": "product_highlight_pip",
+      "talking_head": "pip",
+      "product_image": "fullscreen_hero",
+      "description": "Full-screen product image with left gradient, product highlight text sliding in from left, and talking-head PiP."
+    },
+    "product_highlight_pip_scene_with_gradient_overlay": {
+      "layout": "product_highlight_pip",
+      "talking_head": "pip",
+      "product_image": "fullscreen_hero",
+      "description": "Full-screen product image with baked-in left gradient overlay and talking-head PiP."
+    },
+    "product_pip_head_exit_scene": {
+      "layout": "product_highlight_pip",
+      "talking_head": "pip",
+      "product_image": "fullscreen_hero",
+      "description": "Full-screen product image with left gradient and talking-head PiP; xfades to full-screen head at scene exit."
+    },
+    "talking_head_with_gradient_overlay": {
+      "layout": "talking_head_fullscreen",
+      "talking_head": "full_screen",
+      "description": "Full-screen talking head with baked-in left gradient overlay."
+    },
+    "pip_scene": {
+      "layout": "product_top_2_3_data_bottom_1_3",
+      "talking_head": "pip"
+    },
+    "talk_to_pip_scene": {
+      "layout": "product_top_2_3_data_bottom_1_3",
+      "transition": "talk_to_pip"
+    },
+    "pip_to_talk_scene": {
+      "layout": "product_top_2_3_data_bottom_1_3",
+      "transition": "pip_to_talk"
+    },
+    "product_overlay_float_scene": {
+      "transition": "product_float_to_lower_30",
+      "base": "talking_head_fullscreen"
+    },
+    "flipkart_end_scene": {
+      "transition": "slide_up",
+      "layout": "product_top_2_3_data_bottom_1_3"
+    }
+  },
+  "layout_presets": {
+    "product_top_2_3_data_bottom_1_3": {
+      "product_region": {
+        "x": 0,
+        "y": 0,
+        "w": 720,
+        "h": 640
+      },
+      "data_region": {
+        "x": 0,
+        "y": 640,
+        "w": 720,
+        "h": 320,
+        "color": "#101216",
+        "alpha": 1.0,
+        "corner_radius": 32,
+        "corner_mode": "top"
+      },
+      "product_image": {
+        "background": {
+          "force_original_aspect_ratio": "increase",
+          "crop": true,
+          "blur": {
+            "radius": 28,
+            "power": 1
+          }
+        },
+        "foreground": {
+          "force_original_aspect_ratio": "decrease",
+          "max_w": 660,
+          "max_h": 600
+        }
+      }
+    },
+    "product_fullscreen_hero_image": {
+      "background": {
+        "force_original_aspect_ratio": "increase",
+        "crop": true,
+        "blur": {
+          "radius": 28,
+          "power": 1
+        }
+      },
+      "foreground": {
+        "force_original_aspect_ratio": "decrease",
+        "max_w": 594,
+        "max_h": 783
+      }
+    },
+    "product_highlight_pip": {
+      "gradient": {
+        "width_ratio": 0.5,
+        "max_alpha": 202.4
+      },
+      "text": {
+        "x": 40,
+        "heading_y": 80,
+        "first_label_y": 180,
+        "label_value_gap": 52,
+        "row_gap": 120
+      },
+      "slide_in_duration_ms": 500,
+      "slide_in_start_x": -300,
+      "highlight_delay_sec": 1.0,
+      "highlight_heading_sec": 3.0,
+      "highlight_item_duration_sec": 3.0,
+      "highlight_max_slots": 2
+    },
+    "talking_head_with_product_data_strip": {
+      "strip": {
+        "x": 0,
+        "y": 640,
+        "w": 720,
+        "h": 320,
+        "color": "black",
+        "alpha": 0.86,
+        "transition": "slide_up",
+        "transition_duration": 0.45,
+        "corner_radius": 32,
+        "corner_mode": "top"
+      },
+      "product_badge": {
+        "use_pip_geometry": true,
+        "background_color": "white",
+        "shadow": true
+      }
+    }
+  },
+  "product_image_motion": {
+    "0": {
+      "x_translate": {"start": 90, "end": 0},
+      "y_translate": {"start": 0, "end": 0},
+      "scale": {"start": 1.5, "end": 1.5}
+    },
+    "1": {
+      "x_translate": {"start": 0, "end": 0},
+      "y_translate": {"start": 0, "end": 0},
+      "scale": {"start": 1.5, "end": 2.5}
+    },
+    "2": {
+      "x_translate": {"start": -40, "end": 40},
+      "y_translate": {"start": 40, "end": -40},
+      "scale": {"start": 1.5, "end": 1.5}
+    }
+  },
+  "ass_styles": {
+    "karaoke": {
+      "name": "Karaoke",
+      "font": "Montserrat SemiBold",
+      "font_size": 56,
+      "normal_color": "&HFF0000&",
+      "highlight_color": "&HFFFFFF&",
+      "outline_color": "&H00000000",
+      "outline": 0,
+      "shadow": 2,
+      "back_color": "&H80000000",
+      "alignment": 2,
+      "margin_l": 40,
+      "margin_r": 40,
+      "margin_v": 78,
+      "max_words_per_line": 4
+    },
+    "product_title": {
+      "name": "ProductTitle",
+      "font": "Roboto",
+      "bold": true,
+      "font_size": 34,
+      "color": "&H00E5FF&",
+      "outline_color": "&H00000000",
+      "outline": 3,
+      "shadow": 0,
+      "alignment": 7
+    },
+    "product_bullet": {
+      "name": "ProductBullet",
+      "font": "Roboto",
+      "font_size": 32,
+      "color": "&H00FFFFFF",
+      "outline_color": "&H00000000",
+      "outline": 3,
+      "shadow": 1,
+      "alignment": 7
+    },
+    "product_cta": {
+      "name": "ProductCTA",
+      "font": "Roboto",
+      "font_size": 34,
+      "color": "&H00FFFFFF",
+      "outline_color": "&H00000000",
+      "outline": 4,
+      "shadow": 2,
+      "alignment": 2
+    },
+    "highlight_title": {
+      "name": "HighlightTitle",
+      "font": "Montserrat Bold",
+      "bold": true,
+      "font_size": 42,
+      "color": "&H00FFFFFF",
+      "outline_color": "&H00000000",
+      "outline": 0,
+      "shadow": 0,
+      "alignment": 7
+    },
+    "highlight_label": {
+      "name": "HighlightLabel",
+      "font": "Montserrat Bold",
+      "bold": true,
+      "font_size": 40,
+      "color": "&H00FFFFFF",
+      "outline_color": "&H00000000",
+      "outline": 0,
+      "shadow": 0,
+      "alignment": 7
+    },
+    "highlight_value": {
+      "name": "HighlightValue",
+      "font": "Montserrat Medium",
+      "bold": false,
+      "font_size": 40,
+      "color": "&H0000D7FF",
+      "outline_color": "&H00000000",
+      "outline": 0,
+      "shadow": 0,
+      "alignment": 7
+    },
+    "flipkart_brand": {
+      "name": "FlipkartBrand",
+      "font": "Arial",
+      "font_size": 46,
+      "color": "&H0000EFFF",
+      "outline_color": "&H001A1A1A",
+      "outline": 4,
+      "shadow": 2,
+      "alignment": 2
+    },
+    "product_name_intro": {
+      "name": "ProductNameIntro",
+      "font": "Roboto",
+      "bold": true,
+      "font_size": 44,
+      "color": "&H00FFFFFF",
+      "outline_color": "&H00000000",
+      "outline": 4,
+      "shadow": 2,
+      "alignment": 8
+    }
+  },
+  "product_data_layout": {
+    "component": {
+      "margin_x": 40,
+      "margin_y": 40,
+      "title_offset_y": 40,
+      "bullet_offset_y": 124,
+      "value_x": 183
+    },
+    "title": {
+      "x": 40,
+      "margin_x" : 40,
+      "y": 680,
+      "max_chars": 30,
+      "text_case": "uppercase"
+    },
+    "bullets": {
+      "x": 40,
+      "start_y": 764,
+      "gap": 10,
+      "max_bullets": 4,
+      "max_chars_per_bullet": 34,
+      "name_x": 40,
+      "value_x": 183
+    },
+    "cta": {
+      "x": 360,
+      "y": 925
+    }
+  },
+  "pip_style": {
+    "default_corner": "bottom_right",
+    "aspect_mode": "config_dimensions",
+    "width": 180,
+    "height": 240,
+    "margin_x": 40,
+    "margin_y": 40,
+    "border": 0,
+    "corner_radius": 18,
+    "border_color": "white",
+    "shadow": false,
+    "shadow_blur": 12,
+    "shadow_alpha": 0.28
+  },
+  "transitions": {
+    "talk_to_pip": {
+      "duration": 0.8,
+      "easing": "ease_out_cubic",
+      "expression": "ease = 1 - pow(1 - clip((t - START) / DURATION, 0, 1), 3)"
+    },
+    "pip_to_talk": {
+      "duration": 0.8,
+      "easing": "ease_out_cubic"
+    },
+    "pip_slide_out": {
+      "duration": 0.6,
+      "direction": "right",
+      "easing": "ease_out_cubic"
+    },
+    "product_float_to_lower_30": {
+      "duration": 0.8,
+      "easing": "ease_out_cubic",
+      "final_center_y_ratio": 0.7,
+      "card_width": 320,
+      "card_height": 320,
+      "shadow_blur": 18,
+      "shadow_alpha": 0.3,
+      "sfx": "whoosh_soft_01.wav",
+      "sfx_optional": true
+    },
+    "product_enter": {
+      "duration": 0.45,
+      "easing": "ease_out_cubic",
+      "behavior": "fade_slide_float",
+      "sfx": "product_enter_01.wav",
+      "sfx_optional": true
+    },
+    "bridge_default": {
+      "name": "dip_to_white"
+    }
+  },
+  "transition_library": {
+    "none": {
+      "type": "none",
+      "duration": 0,
+      "description": "Hard cut. Used when a bridge should not dip to white."
+    },
+    "dip_to_white": {
+      "type": "dip",
+      "duration": 0.25,
+      "color": "white",
+      "in": {
+        "filter": "fade",
+        "mode": "from_color"
+      },
+      "out": {
+        "filter": "fade",
+        "mode": "to_color"
+      },
+      "description": "Dip outgoing scene to white, then reveal bridge/next scene from white."
+    },
+    "dip_to_black": {
+      "type": "dip",
+      "duration": 0.35,
+      "color": "white",
+      "in": {
+        "filter": "fade",
+        "mode": "from_color"
+      },
+      "out": {
+        "filter": "fade",
+        "mode": "to_color"
+      },
+      "description": "Dip outgoing scene to white, then reveal bridge/next scene from white."
+    }
+  },
+  "salient_point_rules": {
+    "max_bullets": 4,
+    "max_chars_per_bullet": 38,
+    "prefer": [
+      "main benefit",
+      "unique feature",
+      "trust signal",
+      "use case",
+      "price/value"
+    ],
+    "avoid": [
+      "long specs",
+      "duplicate claims",
+      "generic marketing",
+      "unverifiable claims"
+    ]
+  },
+  "subtitle_safe_area": {
+    "enabled": true,
+    "y": 630,
+    "active_scene_types": [
+      "product_scene",
+      "product_pip_intro_scene",
+      "product_highlight_pip_scene",
+      "product_bridge_gradient_overlay",
+      "product_pip_head_exit_scene",
+      "talking_head_product_strip_scene",
+      "product_bridge_scene",
+      "pip_scene",
+      "talk_to_pip_scene",
+      "pip_to_talk_scene",
+      "flipkart_end_scene"
+    ]
+  },
+  "flipkart_end_scene_style": {
+    "transition_in": "slide_up",
+    "optional_sfx": "flipkart_end_soft_hit.wav",
+    "logo_missing_fallback_text": "Flipkart",
+    "cta_from_product_data": false,
+    "logo_fit": {
+      "max_w": 720,
+      "max_h": 960,
+      "x": "center",
+      "y": "center"
+    }
+  },
+  "watermark": {
+    "path": "assets/Minivet_Watermark.png",
+    "width": 140,
+    "margin_x": 20,
+    "margin_y": 20
+  },
+  "encoder": {
+    "ffmpeg_log_level": "error",
+    "prefer": "libx264",
+    "fallback": "libx264",
+    "filter_complex_threads": 1,
+    "threads": 1,
+    "nvenc": {
+      "preset": "p4",
+      "rc": "vbr",
+      "cq": 24
+    },
+    "libx264": {
+      "preset": "veryfast",
+      "crf": 23,
+      "profile": "main",
+      "level": "4.1",
+      "sliced_threads": true
+    },
+    "video_tag": "avc1",
+    "brand": "mp42",
+    "audio_codec": "aac",
+    "audio_bitrate": "160k",
+    "movflags": "+faststart"
+  }
+}
