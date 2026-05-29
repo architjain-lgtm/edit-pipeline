@@ -1066,14 +1066,14 @@ def _call_tag_matcher(item_id: str, script: str, attributes: list[dict[str, str]
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8")).get("tags", [])
     except urllib.error.HTTPError as exc:
         raise ApiCallError(api_url, payload_str, f"HTTP {exc.code} {exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise ApiCallError(api_url, payload_str, f"URLError: {exc.reason}") from exc
     except TimeoutError:
-        raise ApiCallError(api_url, payload_str, "timeout after 15s") from None
+        raise ApiCallError(api_url, payload_str, "timeout after 30s") from None
     except Exception as exc:  # noqa: BLE001
         raise ApiCallError(api_url, payload_str, f"{type(exc).__name__}: {exc}") from exc
 
