@@ -1,0 +1,76 @@
+{
+  "defaults": {
+    "bridge_duration": 3.0,
+    "end_card_duration": 1.0,
+    "expected_images": 5
+  },
+  "per_video": [
+    {
+      "type": "talking_head_scene",
+      "usage": "vid{video_number} talking head from 0sec to 4s.",
+      "source_start": "source_cursor",
+      "source_duration": 4.0
+    },
+    {
+      "type": "talking_head_product_strip_scene",
+      "usage": "vid{video_number} talking head with black product info strip and bottom-right product image from 4s to 8s.",
+      "source_start": "source_cursor",
+      "source_duration": 4.0,
+      "absorb_remaining_under": 1.0,
+      "product_id": "$item_id",
+      "image_index": {
+        "by_video": [
+          1,
+          2
+        ],
+        "fallback": 0
+      },
+      "show_cta": false,
+      "show_meta": false
+    },
+    {
+      "type": "product_highlight_pip_scene_with_gradient_overlay",
+      "usage": "vid{video_number} product image fullscreen with baked-in gradient highlights and PiP, 0s to 6s.",
+      "source_start": "source_cursor",
+      "source_duration": 6.0,
+      "product_id": "$item_id",
+      "image_index": 0,
+      "show_cta": false,
+      "show_meta": false,
+      "show_product_info": false
+    },
+    {
+      "type": "talking_head_with_gradient_overlay",
+      "usage": "vid{video_number} talking head for remaining source duration with baked-in gradient overlay.",
+      "source_start": "source_cursor",
+      "source_end": "video_end",
+      "product_id": "$item_id",
+      "absorb_remaining_under": 0.0
+    }
+  ],
+  "between_videos": [
+    {
+      "type": "product_bridge_gradient_overlay",
+      "usage": "Gradient bridge before vid{next_video_number} with product info overlay.",
+      "duration": "$bridge_duration",
+      "transition": "dip_to_black",
+      "product_id": "$item_id",
+      "image_index": 0,
+      "show_meta": false
+    }
+  ],
+  "after_all_videos": [
+    {
+      "type": "flipkart_end_scene",
+      "usage": "Flipkart end scene.",
+      "duration": "$end_card_duration",
+      "transition": "dip_to_white",
+      "product_id": "$item_id",
+      "image_index": 0,
+      "show_cta": false,
+      "show_meta": false,
+      "show_product_info": false,
+      "show_subtitles": false
+    }
+  ]
+}
