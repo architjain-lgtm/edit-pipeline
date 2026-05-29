@@ -1195,7 +1195,7 @@ def build_subtitle_cmd(
     gradient_windows: list[GradientWindow] | None = None,
     gradient_png_path: Path | None = None,
 ) -> list[str]:
-    """Burn subtitles into the concat intermediate and produce the final output."""
+    """Burn gradient overlay + watermark + subtitles into the concat intermediate."""
     encoder = style.get("encoder", {})
     _, _, fps = output_size(style)
 
@@ -1203,11 +1203,30 @@ def build_subtitle_cmd(
     fontsdir = f":fontsdir={ffmpeg_filter_quote(user_fonts)}" if user_fonts.is_dir() else ""
     captions_q = ffmpeg_filter_quote(captions_path)
 
-    use_gradient = (
+    use_gradient = bool(
         gradient_windows
         and gradient_png_path is not None
         and gradient_png_path.exists()
     )
+
+    # Resolve watermark path
+    wm_cfg = style.get("watermark", {})
+    wm_path_str = wm_cfg.get("path")
+    wm_path: Path | None = None
+    if wm_path_str:
+        p = Path(wm_path_str)
+        if p.is_absolute():
+            candidates = [p]
+        else:
+            script_dir = Path(__file__).resolve().parent
+            candidates = [script_dir / p, script_dir.parent / p, Path.cwd() / p]
+        for candidate in candidates:
+            if candidate.exists():
+                wm_path = candidate
+                break
+    use_watermark = wm_path is not None
+
+    use_filter_complex = use_gradient or use_watermark
 
     cmd: list[str] = [
         "ffmpeg", "-y", "-nostdin", "-hide_banner", "-nostats",
@@ -1215,22 +1234,48 @@ def build_subtitle_cmd(
         "-i", str(intermediate_path),
     ]
 
-    if use_gradient:
-        # PNG input: loop it for the full video duration so the overlay filter
-        # always has a frame to sample from (trim+setpts inside the overlay chain
-        # resets each window's clock independently).
-        cmd.extend([
-            "-framerate", str(fps),
-            "-i", str(gradient_png_path),
-        ])
-        grad_input_idx = 1
+    next_input_idx = 1
+    grad_input_idx = -1
+    wm_input_idx = -1
 
-        grad_filters = build_gradient_overlay_filters(
-            gradient_windows, grad_input_idx, "0:v", "grad_out", fps,
-            absolute_ts=True,
+    if use_gradient:
+        cmd.extend(["-framerate", str(fps), "-i", str(gradient_png_path)])
+        grad_input_idx = next_input_idx
+        next_input_idx += 1
+
+    if use_watermark:
+        cmd.extend(["-i", str(wm_path)])
+        wm_input_idx = next_input_idx
+        next_input_idx += 1
+
+    if use_filter_complex:
+        graph_parts: list[str] = []
+        cur = "0:v"
+
+        if use_gradient:
+            grad_filters = build_gradient_overlay_filters(
+                gradient_windows, grad_input_idx, cur, "after_grad", fps,
+                absolute_ts=True,
+            )
+            graph_parts.extend(grad_filters)
+            cur = "after_grad"
+
+        if use_watermark:
+            wm_w = int(wm_cfg.get("width", 140))
+            mx = int(wm_cfg.get("margin_x", 20))
+            my = int(wm_cfg.get("margin_y", 20))
+            graph_parts.append(
+                f"[{wm_input_idx}:v]scale={wm_w}:-2:flags=lanczos,format=rgba[wm_scaled]"
+            )
+            graph_parts.append(
+                f"[{cur}][wm_scaled]overlay=x={mx}:y=H-h-{my}:format=auto:eof_action=repeat[after_wm]"
+            )
+            cur = "after_wm"
+
+        graph_parts.append(
+            f"[{cur}]subtitles=filename={captions_q}{fontsdir},format=yuv420p[vout]"
         )
-        sub_filter = f"[grad_out]subtitles=filename={captions_q}{fontsdir},format=yuv420p[vout]"
-        vf = ";".join(grad_filters) + ";" + sub_filter
+        vf = ";".join(graph_parts)
     else:
         vf = f"subtitles=filename={captions_q}{fontsdir},format=yuv420p"
 
@@ -1272,8 +1317,7 @@ def build_subtitle_cmd(
     if encoder.get("brand"):
         container_flags.extend(["-brand", str(encoder["brand"])])
 
-    if use_gradient:
-        # filter_complex needed when we have multiple inputs (video + gradient PNG)
+    if use_filter_complex:
         cmd.extend([
             "-filter_complex", vf,
             "-map", "[vout]",
