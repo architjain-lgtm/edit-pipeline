@@ -1052,13 +1052,15 @@ def attributes_from_tsv_record(record: dict[str, Any]) -> list[dict[str, str]]:
     return []
 
 
-def _call_tag_matcher(item_id: str, script: str, attributes: list[dict[str, str]], api_url: str) -> list[dict[str, Any]]:
-    """Raises ApiCallError on any failure (HTTP error, timeout, URLError, etc.)."""
-    payload_str = json.dumps({
-        "id": item_id,
-        "script": script,
-        "attributes": attributes,
-    })
+def _call_tag_matcher_batch(
+    items: list[dict[str, Any]],
+    api_url: str,
+) -> dict[int, list[dict[str, Any]]]:
+    """Send a batch of script items; return a mapping of script_id -> tags.
+
+    Raises ApiCallError on any failure.
+    """
+    payload_str = json.dumps({"items": items})
     req = urllib.request.Request(
         api_url,
         data=payload_str.encode("utf-8"),
@@ -1066,29 +1068,41 @@ def _call_tag_matcher(item_id: str, script: str, attributes: list[dict[str, str]
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8")).get("tags", [])
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise ApiCallError(api_url, payload_str, f"HTTP {exc.code} {exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise ApiCallError(api_url, payload_str, f"URLError: {exc.reason}") from exc
     except TimeoutError:
-        raise ApiCallError(api_url, payload_str, "timeout after 30s") from None
+        raise ApiCallError(api_url, payload_str, "timeout after 60s") from None
     except Exception as exc:  # noqa: BLE001
         raise ApiCallError(api_url, payload_str, f"{type(exc).__name__}: {exc}") from exc
+    # Response: {"results": [{"script_id": 1, "tags": [...]}, ...]}
+    return {entry["script_id"]: entry.get("tags", []) for entry in result.get("results", [])}
 
 
 def _attributes_as_tags(attributes: list[dict[str, str]]) -> list[dict[str, Any]]:
     return [{"name": a["key"], "value": a["value"]} for a in attributes if a.get("key") and a.get("value")]
 
 
-def fetch_tag_windows(
+def fetch_tags(
     item_id: str,
     clean_ass_paths: list[Path],
     api_url: str,
-    attributes: list[str],
-) -> list[dict[str, Any]]:
-    windows: list[dict[str, Any]] = []
+    attributes: list[dict[str, str]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Single batch call to tag_matcher; returns (tag_windows, bridge_points).
+
+    Builds one item per dialogue chunk ([:4] and [4:] per video) plus one item
+    covering all dialogues for the bridge overlay. script_id is used to match
+    results back to their chunk.
+    """
+    # script_id -> (video_index, start_sec, end_sec)  for tag_window chunks
+    chunk_meta: dict[int, tuple[int, float, float]] = {}
+    items: list[dict[str, Any]] = []
+    script_id = 0
+
     for video_index, ass_path in enumerate(clean_ass_paths):
         dialogues = _parse_ass_dialogues(ass_path)
         if not dialogues:
@@ -1096,29 +1110,48 @@ def fetch_tag_windows(
         for chunk in [dialogues[:4], dialogues[4:]]:
             if not chunk:
                 continue
-            script = " ".join(d["text"] for d in chunk)
-            tags = _call_tag_matcher(item_id, script, attributes, api_url)
-            windows.append({
-                "video_index": video_index,
-                "start_sec": _ass_time_to_sec(chunk[0]["start"]),
-                "end_sec": _ass_time_to_sec(chunk[-1]["end"]),
-                "tags": tags,
+            items.append({
+                "id": item_id,
+                "script_id": script_id,
+                "script": " ".join(d["text"] for d in chunk),
+                "attributes": attributes,
             })
-    return windows
+            chunk_meta[script_id] = (
+                video_index,
+                _ass_time_to_sec(chunk[0]["start"]),
+                _ass_time_to_sec(chunk[-1]["end"]),
+            )
+            script_id += 1
 
-
-def fetch_bridge_overlay_points(
-    item_id: str,
-    clean_ass_paths: list[Path],
-    api_url: str,
-    attributes: list[str],
-) -> list[str]:
+    # One extra item with the full script across all videos for bridge points.
+    bridge_script_id = script_id
     all_dialogues = [d for path in clean_ass_paths for d in _parse_ass_dialogues(path)]
-    if not all_dialogues:
-        return []
-    script = " ".join(d["text"] for d in all_dialogues)
-    tags = _call_tag_matcher(item_id, script, attributes, api_url)
-    return [f"{t['name']}: {t['value']}" for t in tags if t.get("name") and t.get("value")][:4]
+    if all_dialogues:
+        items.append({
+            "id": item_id,
+            "script_id": bridge_script_id,
+            "script": " ".join(d["text"] for d in all_dialogues),
+            "attributes": attributes,
+        })
+
+    if not items:
+        return [], []
+
+    tags_by_id = _call_tag_matcher_batch(items, api_url)
+
+    windows: list[dict[str, Any]] = []
+    for sid, (video_index, start_sec, end_sec) in chunk_meta.items():
+        windows.append({
+            "video_index": video_index,
+            "start_sec": start_sec,
+            "end_sec": end_sec,
+            "tags": tags_by_id.get(sid, []),
+        })
+
+    bridge_tags = tags_by_id.get(bridge_script_id, [])
+    bridge_points = [f"{t['name']}: {t['value']}" for t in bridge_tags if t.get("name") and t.get("value")][:4]
+
+    return windows, bridge_points
 
 
 def shutil_which(cmd: str) -> str | None:
@@ -1425,24 +1458,14 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
 
         _t = time.monotonic()
         http_urls = http_image_urls(tsv_item.raw_images)
-        picker_err: str = ""
         if http_urls:
             api_result: dict[str, Any] | None = None
             if not args.fallback_image_picker:
-                try:
-                    script1_text = str(extract_reference_text(script_record.record, ["script1"]))
-                    script2_text = str(extract_reference_text(script_record.record, ["script2"]))
-                    api_result = call_image_picker_api(
-                        item_id, script1_text, script2_text, http_urls, IMAGE_PICKER_URL
-                    )
-                except VerificationError as exc:
-                    picker_err = f"script extraction error: {exc}"
-                    with ctx.print_lock:
-                        print(f"  [{item_id}] image picker skipped: {picker_err}", flush=True)
-                except ApiCallError as exc:
-                    picker_err = exc.as_failure_reason()
-                    with ctx.print_lock:
-                        print(f"  [{item_id}] image picker failed: {picker_err}", flush=True)
+                script1_text = str(extract_reference_text(script_record.record, ["script1"]))
+                script2_text = str(extract_reference_text(script_record.record, ["script2"]))
+                api_result = call_image_picker_api(
+                    item_id, script1_text, script2_text, http_urls, IMAGE_PICKER_URL
+                )
             else:
                 with ctx.print_lock:
                     print(f"  [{item_id}] image picker skipped (--fallback-image-picker)", flush=True)
@@ -1487,7 +1510,7 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
                 [
                     IMAGE_PICKER_URL,
                     f"local={len(tsv_item.images)}, http_urls={len(http_urls)}",
-                    picker_err or "all downloads failed (see earlier 'image download failed' lines)",
+                    "all downloads failed (see earlier 'image download failed' lines)",
                 ],
                 ensure_ascii=False,
             )
@@ -1630,8 +1653,7 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
                 with ctx.print_lock:
                     print(f"  [{item_id}] tag picker skipped (--fallback-tag-picker), using {len(fallback_tags)} attribute tags", flush=True)
             else:
-                tag_windows = fetch_tag_windows(item_id, clean_paths, TAG_MATCHER_API_URL, attributes)
-                bridge_points = fetch_bridge_overlay_points(item_id, clean_paths, TAG_MATCHER_API_URL, attributes)
+                tag_windows, bridge_points = fetch_tags(item_id, clean_paths, TAG_MATCHER_API_URL, attributes)
             clean_tl = json.loads(clean_timeline_path.read_text(encoding="utf-8"))
             if clean_tl.get("products"):
                 clean_tl["products"][0]["tag_windows"] = tag_windows
