@@ -1456,102 +1456,27 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
         images = list(tsv_item.images)
         expected_images = args.expected_images
 
-        _t = time.monotonic()
         http_urls = http_image_urls(tsv_item.raw_images)
-        if http_urls:
-            api_result: dict[str, Any] | None = None
-            if not args.fallback_image_picker:
-                script1_text = str(extract_reference_text(script_record.record, ["script1"]))
-                script2_text = str(extract_reference_text(script_record.record, ["script2"]))
-                api_result = call_image_picker_api(
-                    item_id, script1_text, script2_text, http_urls, IMAGE_PICKER_URL
-                )
-            else:
-                with ctx.print_lock:
-                    print(f"  [{item_id}] image picker skipped (--fallback-image-picker)", flush=True)
-            if api_result is not None:
-                hero_url = api_result.get("hero_image_url", "")
-                s1_urls = api_result.get("script1_image_urls", [])
-                s2_urls = api_result.get("script2_image_urls", [])
-                # Slot order matches image_index convention:
-                # [0] hero, [1] script-1 image, [2] script-2 image.
-                # Only the first picked image per script is used; s1[1]/s2[1] are intentionally dropped.
-                url_slots = [
-                    hero_url,
-                    s1_urls[0] if s1_urls else "",
-                    s2_urls[0] if s2_urls else "",
-                ]
-                picked: list[Path] = []
-                for slot_url in url_slots:
-                    if not slot_url:
-                        continue
-                    resolved = download_image_url(slot_url, item_id, args.image_cache_dir)
-                    if resolved:
-                        picked.append(resolved)
-                if len(picked) >= 2:
-                    images = picked
-            if len(images) < expected_images:
-                images.extend(
-                    download_selected_http_images(
-                        http_urls,
-                        item_id,
-                        args.image_cache_dir,
-                        limit=expected_images - len(images),
-                        existing=images,
-                    )
-                )
-        _elapsed = time.monotonic() - _t
-        row["time_image_picker_s"] = round(_elapsed, 2)
-        with ctx.print_lock:
-            print(f"  [{item_id}] images: {len(images)} ready in {_elapsed:.1f}s", flush=True)
 
-        if not images:
-            diagnostic = json.dumps(
-                [
-                    IMAGE_PICKER_URL,
-                    f"local={len(tsv_item.images)}, http_urls={len(http_urls)}",
-                    "all downloads failed (see earlier 'image download failed' lines)",
-                ],
-                ensure_ascii=False,
-            )
-            raise RuntimeError(f"zero images: {diagnostic}")
-
-        row["images_found_count"] = len(images)
-        row["images_found_paths"] = [repo_path(path) for path in images]
-        if len(images) < expected_images:
-            review_reasons.append(f"fewer than {expected_images} images")
-
-        _t = time.monotonic()
+        # --- Phase 1: trim + ASS generation in parallel ---
         args.trimmed_video_dir.mkdir(parents=True, exist_ok=True)
-        trimmed_pair: dict[int, BatchVideo] = {}
-        for script_index in [1, 2]:
-            src = pair[script_index].path
-            dst = args.trimmed_video_dir / src.name
-            trim_video(src, dst, force=args.force_trim)
-            row[f"trimmed_video_path_script{script_index}"] = repo_path(dst)
-            trimmed_pair[script_index] = BatchVideo(
-                item_id=item_id,
-                script_index=script_index,
-                product_slug=pair[script_index].product_slug,
-                path=dst,
-            )
-        _elapsed = time.monotonic() - _t
-        row["time_trim_s"] = round(_elapsed, 2)
-        with ctx.print_lock:
-            print(f"  [{item_id}] trim: {_elapsed:.1f}s", flush=True)
-
-        _t = time.monotonic()
         args.ass_dir.mkdir(parents=True, exist_ok=True)
+        trimmed_pair: dict[int, BatchVideo] = {}
         ass_model_load_s = 0.0
         ass_audio_extract_s = 0.0
         ass_transcribe_s = 0.0
         ass_write_s = 0.0
         ass_worker_wait_s = 0.0
 
-        def run_ass_script(script_index: int) -> tuple[int, Path, float, float, dict[str, float]]:
-            script_started = time.monotonic()
-            video_path = trimmed_pair[script_index].path
-            ass_path = args.ass_dir / f"{video_path.stem}.ass"
+        def run_trim_and_ass(script_index: int) -> tuple[int, Path, Path, float, float, float, dict[str, float]]:
+            trim_started = time.monotonic()
+            src = pair[script_index].path
+            dst = args.trimmed_video_dir / src.name
+            trim_video(src, dst, force=args.force_trim)
+            time_trim = time.monotonic() - trim_started
+
+            ass_started = time.monotonic()
+            ass_path = args.ass_dir / f"{dst.stem}.ass"
             metrics = {"model_load_s": 0.0, "transcribe_s": 0.0, "split_s": 0.0, "write_s": 0.0}
             wait_s = 0.0
             try:
@@ -1562,27 +1487,38 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
                 wait_started = time.monotonic()
                 with ctx.ass_pool.acquire() as worker:
                     wait_s = time.monotonic() - wait_started
-                    metrics = generate_ass(args, video_path, ass_path, script_text, worker=worker)
+                    metrics = generate_ass(args, dst, ass_path, script_text, worker=worker)
             else:
                 wait_started = time.monotonic()
                 with ctx.ass_semaphore:
                     wait_s = time.monotonic() - wait_started
-                    metrics = generate_ass(args, video_path, ass_path, script_text)
-            return script_index, ass_path, time.monotonic() - script_started, wait_s, metrics
+                    metrics = generate_ass(args, dst, ass_path, script_text)
+            time_ass = time.monotonic() - ass_started
+            return script_index, dst, ass_path, time_trim, time_ass, wait_s, metrics
 
-        with ThreadPoolExecutor(max_workers=2) as ass_executor:
-            futures = [ass_executor.submit(run_ass_script, script_index) for script_index in [1, 2]]
-            for future in as_completed(futures):
-                script_index, ass_path, script_elapsed, worker_wait_s, metrics = future.result()
+        _t_phase1 = time.monotonic()
+        with ThreadPoolExecutor(max_workers=2) as phase1_executor:
+            trim_ass_futures = [phase1_executor.submit(run_trim_and_ass, si) for si in [1, 2]]
+            for future in as_completed(trim_ass_futures):
+                script_index, trimmed_path, ass_path, time_trim, time_ass, worker_wait_s, metrics = future.result()
+                trimmed_pair[script_index] = BatchVideo(
+                    item_id=item_id,
+                    script_index=script_index,
+                    product_slug=pair[script_index].product_slug,
+                    path=trimmed_path,
+                )
+                row[f"trimmed_video_path_script{script_index}"] = repo_path(trimmed_path)
+                row[f"ass_path_script{script_index}"] = repo_path(ass_path)
+                row[f"time_ass_script{script_index}_s"] = round(time_trim + time_ass, 2)
                 ass_model_load_s += metrics["model_load_s"]
                 ass_audio_extract_s += metrics.get("audio_extract_s", 0.0)
                 ass_transcribe_s += metrics["transcribe_s"]
                 ass_write_s += metrics["write_s"]
                 ass_worker_wait_s += worker_wait_s
-                row[f"ass_path_script{script_index}"] = repo_path(ass_path)
-                row[f"time_ass_script{script_index}_s"] = round(script_elapsed, 2)
-        _elapsed = time.monotonic() - _t
-        row["time_ass_s"] = round(_elapsed, 2)
+
+        _elapsed_phase1 = time.monotonic() - _t_phase1
+        row["time_trim_s"] = round(_elapsed_phase1, 2)
+        row["time_ass_s"] = round(_elapsed_phase1, 2)
         row["time_ass_worker_wait_s"] = round(ass_worker_wait_s, 2)
         row["time_ass_model_load_s"] = round(ass_model_load_s, 2)
         row["time_ass_audio_extract_s"] = round(ass_audio_extract_s, 2)
@@ -1590,16 +1526,20 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
         row["time_ass_write_s"] = round(ass_write_s, 2)
         with ctx.print_lock:
             print(
-                f"  [{item_id}] ass: {_elapsed:.1f}s "
+                f"  [{item_id}] phase1 (trim+ass): {_elapsed_phase1:.1f}s "
                 f"(s1={row['time_ass_script1_s']}, s2={row['time_ass_script2_s']}, "
                 f"worker_wait={row['time_ass_worker_wait_s']}, "
                 f"load={row['time_ass_model_load_s']}, tx={row['time_ass_transcribe_s']})",
                 flush=True,
             )
 
+        # --- Phase 2: image_picker + fetch_tags in parallel (both need clean ASS) ---
         _t = time.monotonic()
         args.out_timeline_dir.mkdir(parents=True, exist_ok=True)
         catalog = {item_id: tsv_item.record}
+
+        # Build a placeholder timeline with existing images to get clean_paths for tag matching.
+        # The final timeline is rebuilt after images are resolved.
         timeline = build_timeline_for_item(
             item_id,
             trimmed_pair,
@@ -1634,35 +1574,137 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
         if remaining_issues:
             review_reasons.append(f"clean ASS has {remaining_issues} remaining review issue(s)")
 
-        if clean_paths:
-            _t = time.monotonic()
-            attributes = attributes_from_tsv_record(tsv_item.record)
-            if args.fallback_tag_picker:
-                fallback_tags = _attributes_as_tags(attributes)
-                tag_windows = []
-                for vi, p in enumerate(clean_paths):
-                    dialogues = _parse_ass_dialogues(p)
-                    if dialogues:
-                        tag_windows.append({
-                            "video_index": vi,
-                            "start_sec": _ass_time_to_sec(dialogues[0]["start"]),
-                            "end_sec": _ass_time_to_sec(dialogues[-1]["end"]),
-                            "tags": fallback_tags,
-                        })
-                bridge_points = [f"{t['name']}: {t['value']}" for t in fallback_tags][:4]
+        attributes = attributes_from_tsv_record(tsv_item.record)
+
+        def run_image_picker() -> dict[str, Any] | None:
+            if not http_urls:
+                return None
+            if args.fallback_image_picker:
                 with ctx.print_lock:
-                    print(f"  [{item_id}] tag picker skipped (--fallback-tag-picker), using {len(fallback_tags)} attribute tags", flush=True)
-            else:
-                tag_windows, bridge_points = fetch_tags(item_id, clean_paths, TAG_MATCHER_API_URL, attributes)
+                    print(f"  [{item_id}] image picker skipped (--fallback-image-picker)", flush=True)
+                return None
+            script1_text = str(extract_reference_text(script_record.record, ["script1"]))
+            script2_text = str(extract_reference_text(script_record.record, ["script2"]))
+            return call_image_picker_api(item_id, script1_text, script2_text, http_urls, IMAGE_PICKER_URL)
+
+        def run_fetch_tags() -> tuple[list[dict[str, Any]], list[str]]:
+            if not clean_paths or args.fallback_tag_picker:
+                with ctx.print_lock:
+                    print(f"  [{item_id}] tag picker skipped (--fallback-tag-picker), leaving tag_windows and bridge_points empty", flush=True)
+                return [], []
+            return fetch_tags(item_id, clean_paths, TAG_MATCHER_API_URL, attributes)
+
+        _t_phase2 = time.monotonic()
+        with ThreadPoolExecutor(max_workers=2) as phase2_executor:
+            image_picker_future = phase2_executor.submit(run_image_picker)
+            fetch_tags_future = phase2_executor.submit(run_fetch_tags)
+            image_picker_api_result = image_picker_future.result()
+            tag_windows, bridge_points = fetch_tags_future.result()
+
+        _elapsed_image_picker = time.monotonic() - _t_phase2
+        row["time_image_picker_s"] = round(_elapsed_image_picker, 2)
+        _elapsed_tag_windows = time.monotonic() - _t_phase2
+        row["time_tag_windows_s"] = round(_elapsed_tag_windows, 2)
+        with ctx.print_lock:
+            print(
+                f"  [{item_id}] phase2 (image_picker+tag_matcher): {_elapsed_image_picker:.1f}s "
+                f"tag_windows={len(tag_windows)}, bridge_points={len(bridge_points)}",
+                flush=True,
+            )
+
+        # Resolve images from picker result
+        _t = time.monotonic()
+        if http_urls:
+            if image_picker_api_result is not None:
+                hero_url = image_picker_api_result.get("hero_image_url", "")
+                s1_urls = image_picker_api_result.get("script1_image_urls", [])
+                s2_urls = image_picker_api_result.get("script2_image_urls", [])
+                # Slot order matches image_index convention:
+                # [0] hero, [1] script-1 image, [2] script-2 image.
+                # Only the first picked image per script is used; s1[1]/s2[1] are intentionally dropped.
+                url_slots = [
+                    hero_url,
+                    s1_urls[0] if s1_urls else "",
+                    s2_urls[0] if s2_urls else "",
+                ]
+                picked: list[Path] = []
+                for slot_url in url_slots:
+                    if not slot_url:
+                        continue
+                    resolved = download_image_url(slot_url, item_id, args.image_cache_dir)
+                    if resolved:
+                        picked.append(resolved)
+                if len(picked) >= 2:
+                    images = picked
+            if len(images) < expected_images:
+                images.extend(
+                    download_selected_http_images(
+                        http_urls,
+                        item_id,
+                        args.image_cache_dir,
+                        limit=expected_images - len(images),
+                        existing=images,
+                    )
+                )
+        with ctx.print_lock:
+            print(f"  [{item_id}] images: {len(images)} ready in {time.monotonic() - _t:.1f}s", flush=True)
+
+        if not images:
+            diagnostic = json.dumps(
+                [
+                    IMAGE_PICKER_URL,
+                    f"local={len(tsv_item.images)}, http_urls={len(http_urls)}",
+                    "all downloads failed (see earlier 'image download failed' lines)",
+                ],
+                ensure_ascii=False,
+            )
+            raise RuntimeError(f"zero images: {diagnostic}")
+
+        row["images_found_count"] = len(images)
+        row["images_found_paths"] = [repo_path(path) for path in images]
+        if len(images) < expected_images:
+            review_reasons.append(f"fewer than {expected_images} images")
+
+        # Rebuild timeline with final resolved images and write tag_windows into clean.json
+        _t = time.monotonic()
+        timeline = build_timeline_for_item(
+            item_id,
+            trimmed_pair,
+            catalog=catalog,
+            images=images,
+            output_dir=args.out_timeline_dir,
+            ass_dir=args.ass_dir,
+            rendered_dir=args.out_video_dir,
+            timeline_config=ctx.timeline_config,
+            bridge_duration=args.bridge_duration,
+            end_card_duration=args.end_card_duration,
+            expected_images=expected_images,
+        )
+        timeline_path.write_text(json.dumps(timeline, indent=2) + "\n", encoding="utf-8")
+
+        clean_paths, clean_timeline_path, remaining_issues = clean_ass_and_timeline(
+            timeline_path,
+            script_record.record,
+            reference_fields=["script1", "script2"],
+            style_path=args.style,
+        )
+        _elapsed = time.monotonic() - _t
+        row["time_timeline_clean_ass_s"] = round(row["time_timeline_clean_ass_s"] + _elapsed, 2)
+        with ctx.print_lock:
+            print(f"  [{item_id}] timeline+clean_ass (final): {_elapsed:.1f}s", flush=True)
+
+        row["clean_ass_path_script1"] = repo_path(clean_paths[0]) if clean_paths else ""
+        row["clean_ass_path_script2"] = repo_path(clean_paths[1]) if len(clean_paths) > 1 else ""
+        row["clean_timeline_json_path"] = repo_path(clean_timeline_path)
+        if remaining_issues:
+            review_reasons.append(f"clean ASS has {remaining_issues} remaining review issue(s)")
+
+        if clean_paths:
             clean_tl = json.loads(clean_timeline_path.read_text(encoding="utf-8"))
             if clean_tl.get("products"):
                 clean_tl["products"][0]["tag_windows"] = tag_windows
                 clean_tl["products"][0]["bridge_overlay_points"] = bridge_points
             clean_timeline_path.write_text(json.dumps(clean_tl, indent=2) + "\n", encoding="utf-8")
-            _elapsed = time.monotonic() - _t
-            row["time_tag_windows_s"] = round(_elapsed, 2)
-            with ctx.print_lock:
-                print(f"  [{item_id}] tag_windows: {len(tag_windows)}, bridge_points: {len(bridge_points)} in {_elapsed:.1f}s", flush=True)
 
         # Tentative status; render_step will overwrite to FAIL if render breaks.
         row["status"] = "REVIEW" if review_reasons else "PASS"
