@@ -30,7 +30,7 @@ FLIPKART_LOGO = Path(__file__).resolve().parent.parent / "assets" / "flipkart_lo
 from typing import Any
 
 
-VIDEO_RE = re.compile(r"^(ITM[A-Za-z0-9]+).*_script([12])_([^./]+)\.(?:mp4|mov)$", re.IGNORECASE)
+VIDEO_RE = re.compile(r"^(ITM[A-Za-z0-9]+).*_script([12])(?:_([^./]+))?\.(?:mp4|mov)$", re.IGNORECASE)
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 IMAGE_NUMBER_RE = re.compile(r"_(\d+)(?:\.[^.]+)$")
 DEFAULT_TIMELINE_CONFIG_PATH = Path("timeline_generation_config.json")
@@ -195,7 +195,7 @@ def discover_videos(batch_dir: Path) -> dict[str, dict[int, BatchVideo]]:
             continue
         item_id = match.group(1)
         script_index = int(match.group(2))
-        product_slug = match.group(3)
+        product_slug = match.group(3) or ""
         pairs.setdefault(item_id, {})[script_index] = BatchVideo(item_id, script_index, product_slug, path)
     return pairs
 

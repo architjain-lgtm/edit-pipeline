@@ -437,7 +437,7 @@ def discover_batch_items(batch_dir: Path) -> tuple[list[DiscoveredItem], dict[st
             continue
         item_id = match.group(1)
         script_index = int(match.group(2))
-        product_slug = match.group(3)
+        product_slug = match.group(3) or ""
         first_seen.setdefault(item_id, index)
         pairs.setdefault(item_id, {})[script_index] = BatchVideo(item_id, script_index, product_slug, path)
 
