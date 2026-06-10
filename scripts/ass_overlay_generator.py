@@ -1433,10 +1433,49 @@ def _match_bullets_to_subtitle_windows(
     return windows or None
 
 
-def _truncate_highlight_text(text: str, max_chars: int = 13) -> str:
+def _truncate_highlight_text(text: str, max_chars: int = 16) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "..."
+
+
+def _dedup_window_tags(
+    product: dict[str, Any], max_per_window: int = 2
+) -> dict[tuple[int, float], list[tuple[str, str]]]:
+    """Assign each tag window up to max_per_window display tags, never
+    repeating an attribute name across the product's windows (scripts 1 and 2
+    combined). Windows are processed in playback order; a window whose valid
+    attributes were all shown by earlier windows simply gets none.
+
+    Computed from product data alone so every per-scene call sees the same
+    assignment.
+    """
+    windows = sorted(
+        product.get("tag_windows", []) or [],
+        key=lambda w: (int(w.get("video_index", 0)), float(w.get("start_sec", 0.0))),
+    )
+    used_names: set[str] = set()
+    assigned: dict[tuple[int, float], list[tuple[str, str]]] = {}
+    for w in windows:
+        key = (int(w.get("video_index", 0)), float(w.get("start_sec", 0.0)))
+        picked: list[tuple[str, str]] = []
+        for tag in w.get("tags", []):
+            if len(picked) >= max_per_window:
+                break
+            lbl = str(tag.get("short_attribute") or tag.get("name", "")).replace("_", " ").strip()
+            val = str(tag.get("value", "")).strip()
+            if not (lbl or val):
+                continue
+            filtered = _filter_overlay_gradient_items([(lbl, val)])
+            if not filtered:
+                continue
+            name_key = normalize_for_compare(filtered[0][0])
+            if name_key in used_names:
+                continue
+            used_names.add(name_key)
+            picked.append(filtered[0])
+        assigned[key] = picked
+    return assigned
 
 
 def _emit_highlight_items(
@@ -1673,6 +1712,11 @@ def highlight_pip_events(
             # This video has tag windows, but they all belong to sibling
             # scenes — no highlight overlay here.
             return []
+        # Per-window display tags: filtered (type, unapproved brand, ...),
+        # capped at 2 and deduped so an attribute name shown in one window
+        # never repeats in a later window of either script (a window may end
+        # up with no tags at all).
+        window_tags = _dedup_window_tags(product)
         tw_items: list[tuple[str, str]] = []
         tw_starts: list[float] = []
         for w in tag_windows:
@@ -1680,21 +1724,12 @@ def highlight_pip_events(
             t = max(raw_t, delay_sec)
             if t >= scene_dur:
                 continue
-            # Filter first, then assign timing by filtered index so that
-            # removed attributes (type, unapproved brand, etc.) don't consume
-            # timing slots and push valid items past scene_dur.
-            valid_tags: list[tuple[str, str]] = []
-            for tag in w.get("tags", []):
-                lbl = str(tag.get("short_attribute") or tag.get("name", "")).replace("_", " ").strip()
-                val = str(tag.get("value", "")).strip()
-                if not (lbl or val):
-                    continue
-                filtered_items = _filter_overlay_gradient_items([(lbl, val)])
-                if filtered_items:
-                    valid_tags.append(filtered_items[0])
-            # At most 2 tags per window; pull a late item back so it still
-            # gets its full display before the scene ends (slots stack, so
-            # overlapping items render in separate rows).
+            valid_tags = window_tags.get(
+                (int(w.get("video_index", 0)), float(w.get("start_sec", 0.0))), []
+            )
+            # Pull a late item back so it still gets its full display before
+            # the scene ends (slots stack, so overlapping items render in
+            # separate rows).
             for j, (lbl, val) in enumerate(valid_tags[:2]):
                 item_t = t + j * item_dur
                 if item_t + item_dur > scene_dur:
