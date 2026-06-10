@@ -1,0 +1,61 @@
+{
+  "defaults": {
+    "bridge_duration": 3.0,
+    "end_card_duration": 1.0,
+    "expected_images": 5,
+    "image_slot_layout": "per_script_pair"
+  },
+  "per_video": [
+    {
+      "type": "product_highlight_pip_scene_with_gradient_overlay",
+      "usage": "vid{video_number} first script image fullscreen with PiP talking head, first half of the video.",
+      "source_start": "source_cursor",
+      "source_duration": "$video_half_duration",
+      "product_id": "$item_id",
+      "image_index": {"by_video": [1, 3], "fallback": 0},
+      "motion_index": {"by_video": [0, 2]},
+      "show_cta": false,
+      "show_meta": false,
+      "show_product_info": false
+    },
+    {
+      "type": "product_highlight_pip_scene_with_gradient_overlay",
+      "usage": "vid{video_number} second script image fullscreen with PiP talking head, second half of the video.",
+      "source_start": "source_cursor",
+      "source_end": "video_end",
+      "product_id": "$item_id",
+      "image_index": {"by_video": [2, 4], "fallback": 0},
+      "motion_index": {"by_video": [2, 0]},
+      "show_cta": false,
+      "show_meta": false,
+      "show_product_info": false,
+      "absorb_remaining_under": 0.0
+    }
+  ],
+  "between_videos": [
+    {
+      "type": "product_bridge_gradient_overlay",
+      "usage": "Gradient bridge before vid{next_video_number} with product info overlay.",
+      "duration": "$bridge_duration",
+      "transition": "dip_to_white",
+      "product_id": "$item_id",
+      "image_index": 0,
+      "motion_index": 1,
+      "show_meta": false
+    }
+  ],
+  "after_all_videos": [
+    {
+      "type": "flipkart_end_scene",
+      "usage": "Flipkart end scene.",
+      "duration": "$end_card_duration",
+      "transition": "dip_to_white",
+      "product_id": "$item_id",
+      "image_index": 0,
+      "show_cta": false,
+      "show_meta": false,
+      "show_product_info": false,
+      "show_subtitles": false
+    }
+  ]
+}

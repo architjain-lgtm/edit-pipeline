@@ -1433,6 +1433,54 @@ def _match_bullets_to_subtitle_windows(
     return windows or None
 
 
+def _truncate_highlight_text(text: str, max_chars: int = 16) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
+
+
+def _dedup_window_tags(
+    product: dict[str, Any], max_per_window: int = 2
+) -> dict[tuple[int, float], list[tuple[str, str]]]:
+    """Assign each tag window up to max_per_window display tags, never
+    repeating an attribute name within the same video's windows (repeats
+    across videos are fine — each script covers its own ground). Windows are
+    processed in playback order; a window whose valid attributes were all
+    shown by an earlier window of the same video simply gets none.
+
+    Computed from product data alone so every per-scene call sees the same
+    assignment.
+    """
+    windows = sorted(
+        product.get("tag_windows", []) or [],
+        key=lambda w: (int(w.get("video_index", 0)), float(w.get("start_sec", 0.0))),
+    )
+    used_names_by_video: dict[int, set[str]] = {}
+    assigned: dict[tuple[int, float], list[tuple[str, str]]] = {}
+    for w in windows:
+        video_index = int(w.get("video_index", 0))
+        key = (video_index, float(w.get("start_sec", 0.0)))
+        used_names = used_names_by_video.setdefault(video_index, set())
+        picked: list[tuple[str, str]] = []
+        for tag in w.get("tags", []):
+            if len(picked) >= max_per_window:
+                break
+            lbl = str(tag.get("short_attribute") or tag.get("name", "")).replace("_", " ").strip()
+            val = str(tag.get("value", "")).strip()
+            if not (lbl or val):
+                continue
+            filtered = _filter_overlay_gradient_items([(lbl, val)])
+            if not filtered:
+                continue
+            name_key = normalize_for_compare(filtered[0][0])
+            if name_key in used_names:
+                continue
+            used_names.add(name_key)
+            picked.append(filtered[0])
+        assigned[key] = picked
+    return assigned
+
+
 def _emit_highlight_items(
     items: list[tuple[str, str]],
     evt_start: float,
@@ -1469,8 +1517,8 @@ def _emit_highlight_items(
     for idx, (lbl, val) in enumerate(capped):
         label_y = first_label_y + idx * row_gap
         value_y = label_y + label_value_gap
-        lbl = lbl.replace("_", " ").upper() if lbl else ""
-        val = val.replace("_", " ").upper() if val else ""
+        lbl = _truncate_highlight_text(lbl.replace("_", " ").upper()) if lbl else ""
+        val = _truncate_highlight_text(val.replace("_", " ").upper()) if val else ""
         fad = f"\\fad({slide_ms},{slide_out_ms})"
         if lbl and val:
             events.append(dialogue(evt_start, evt_end, label_style, positioned_text(x, label_y, lbl, fad), layer=24))
@@ -1553,6 +1601,7 @@ def highlight_pip_events(
     chunk_size: int = 2,
     delay_override: float | None = None,
     _gradient_windows: list[GradientWindow] | None = None,
+    sibling_scenes: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     layout = style.get("layout_presets", {}).get("product_highlight_pip", {})
     text_cfg = layout.get("text", {})
@@ -1632,11 +1681,45 @@ def highlight_pip_events(
             ))
 
     # --- tag_windows path: pre-computed audio-synced windows ---
+    _BURN_SCENE_TYPES = {"product_highlight_pip_scene", "product_highlight_pip_scene_with_gradient_overlay"}
     tag_windows = sorted(
         [w for w in product.get("tag_windows", []) if w.get("video_index") == video_idx],
         key=lambda w: w["start_sec"],
     )
-    if tag_windows and scene.get("type") in {"product_highlight_pip_scene", "product_highlight_pip_scene_with_gradient_overlay"}:
+    had_tag_windows = bool(tag_windows)
+    if tag_windows and sibling_scenes and scene.get("type") in _BURN_SCENE_TYPES:
+        # Assign each window to exactly one eligible scene so a window that
+        # spans a scene boundary doesn't burn into every scene it overlaps
+        # (duplicate, overlapping rows). A window belongs to the last eligible
+        # scene starting at or before it; windows that start before all
+        # eligible scenes belong to the first one.
+        eligible = sorted(
+            [
+                s for s in sibling_scenes
+                if s.get("type") in _BURN_SCENE_TYPES
+                and int(s.get("talking_head_video_index", s.get("video_index", 0))) == video_idx
+            ],
+            key=scene_source_start,
+        )
+        if eligible:
+            def _owner(w: dict[str, Any]) -> dict[str, Any]:
+                owner = eligible[0]
+                for s in eligible:
+                    if scene_source_start(s) <= float(w["start_sec"]):
+                        owner = s
+                return owner
+
+            tag_windows = [w for w in tag_windows if _owner(w) is scene]
+    if had_tag_windows and scene.get("type") in _BURN_SCENE_TYPES:
+        if not tag_windows:
+            # This video has tag windows, but they all belong to sibling
+            # scenes — no highlight overlay here.
+            return []
+        # Per-window display tags: filtered (type, unapproved brand, ...),
+        # capped at 2 and deduped so an attribute name shown in one window
+        # never repeats in a later window of either script (a window may end
+        # up with no tags at all).
+        window_tags = _dedup_window_tags(product)
         tw_items: list[tuple[str, str]] = []
         tw_starts: list[float] = []
         for w in tag_windows:
@@ -1644,21 +1727,17 @@ def highlight_pip_events(
             t = max(raw_t, delay_sec)
             if t >= scene_dur:
                 continue
-            # Filter first, then assign timing by filtered index so that
-            # removed attributes (type, unapproved brand, etc.) don't consume
-            # timing slots and push valid items past scene_dur.
-            valid_tags: list[tuple[str, str]] = []
-            for tag in w.get("tags", []):
-                lbl = str(tag.get("short_attribute") or tag.get("name", "")).replace("_", " ").strip()
-                val = str(tag.get("value", "")).strip()
-                if not (lbl or val):
-                    continue
-                filtered_items = _filter_overlay_gradient_items([(lbl, val)])
-                if filtered_items:
-                    valid_tags.append(filtered_items[0])
-            for j, (lbl, val) in enumerate(valid_tags):
+            valid_tags = window_tags.get(
+                (int(w.get("video_index", 0)), float(w.get("start_sec", 0.0))), []
+            )
+            # Pull a late item back so it still gets its full display before
+            # the scene ends (slots stack, so overlapping items render in
+            # separate rows).
+            for j, (lbl, val) in enumerate(valid_tags[:2]):
                 item_t = t + j * item_dur
-                if item_t >= scene_dur:
+                if item_t + item_dur > scene_dur:
+                    item_t = max(t, scene_dur - item_dur)
+                if item_t + item_dur > scene_dur:
                     break
                 tw_items.append((lbl, val))
                 tw_starts.append(item_t)
@@ -1891,7 +1970,7 @@ def generated_events(
         if scene_type in {"product_highlight_pip_scene", "product_highlight_pip_scene_with_gradient_overlay", "product_pip_head_exit_scene"} and product:
             key = (scene_type, str(pid), float(scene["start"]), float(scene["end"]))
             if key not in seen_product_scene_keys:
-                events.extend(highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=not heading_shown, _gradient_windows=_gradient_windows))
+                events.extend(highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=not heading_shown, _gradient_windows=_gradient_windows, sibling_scenes=scenes))
                 heading_shown = True
                 seen_product_scene_keys.add(key)
         elif scene_type == "product_bridge_gradient_overlay" and product:
@@ -1909,6 +1988,7 @@ def generated_events(
                     chunk_size=1,
                     delay_override=0.0,
                     _gradient_windows=_gradient_windows,
+                    sibling_scenes=scenes,
                 ))
                 seen_product_scene_keys.add(key)
         elif scene_type in PRODUCT_SCENE_TYPES and product:
@@ -2002,7 +2082,7 @@ def collect_gradient_windows(
         if scene_type in {"product_highlight_pip_scene", "product_highlight_pip_scene_with_gradient_overlay", "product_pip_head_exit_scene"} and product:
             key = (scene_type, str(pid), float(scene["start"]), float(scene["end"]))
             if key not in seen_product_scene_keys:
-                highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=not heading_shown, _gradient_windows=windows)
+                highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=not heading_shown, _gradient_windows=windows, sibling_scenes=scenes)
                 heading_shown = True
                 seen_product_scene_keys.add(key)
         elif scene_type == "product_bridge_gradient_overlay" and product:
@@ -2013,7 +2093,7 @@ def collect_gradient_windows(
         elif scene_type in AUDIO_OVERLAY_SCENE_TYPES and product:
             key = (scene_type, str(pid), float(scene["start"]), float(scene["end"]))
             if key not in seen_product_scene_keys:
-                highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=False, chunk_size=1, delay_override=0.0, _gradient_windows=windows)
+                highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=False, chunk_size=1, delay_override=0.0, _gradient_windows=windows, sibling_scenes=scenes)
                 seen_product_scene_keys.add(key)
 
     return windows

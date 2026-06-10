@@ -466,6 +466,7 @@ def append_video_scenes(
         "video_number": video_index + 1,
         "video_label": f"vid{video_index + 1}",
         "video_duration": video_duration,
+        "video_half_duration": video_duration / 2.0,
         "bridge_duration": bridge_duration,
         "end_card_duration": end_card_duration,
     }

@@ -65,6 +65,7 @@ from verify_ass_against_script import (  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 IMAGE_PICKER_URL = "http://10.12.46.8:8084/image_picker_triplet"
+ARTIFACT_URL = "http://10.12.46.7:30080/artifacts/{artifact_id}/file?tenant_id=Flipkart"
 TSV_PROGRESS_EVERY_ROWS = 100_000
 
 
@@ -117,6 +118,7 @@ REPORT_FIELDS = [
     "output_video_path",
     "time_tsv_index_load_s",
     "time_image_picker_s",
+    "time_video_download_s",
     "time_trim_s",
     "time_ass_s",
     "time_ass_script1_s",
@@ -129,6 +131,8 @@ REPORT_FIELDS = [
     "time_timeline_clean_ass_s",
     "time_tag_windows_s",
     "time_render_s",
+    "time_render_cpu_s",
+    "time_render_cpu_pct",
 ]
 
 
@@ -361,6 +365,8 @@ class PipelineContext:
     ass_semaphore: threading.Semaphore
     ass_pool: Any = None  # WhisperXWorkerPool | StableTsWorkerPool | None
     tsv_index_load_s: float = 0.0
+    # item_id -> {script_index: artifact_id}; videos downloaded on demand in prepare_item
+    artifact_map: dict[str, dict[int, str]] = field(default_factory=dict)
 
 
 def repo_path(path: Path | str | None) -> str:
@@ -448,6 +454,71 @@ def discover_batch_items(batch_dir: Path) -> tuple[list[DiscoveredItem], dict[st
     ]
     complete.sort(key=lambda item: item.first_seen)
     return complete, pairs
+
+
+def download_artifact(artifact_id: str, dest: Path) -> None:
+    if dest.exists() and dest.stat().st_size > 0:
+        return
+    url = ARTIFACT_URL.format(artifact_id=artifact_id)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} for {url}")
+        with tmp.open("wb") as handle:
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                handle.write(chunk)
+    tmp.replace(dest)
+
+
+def merge_manifest_items(
+    manifest_path: Path,
+    batch_dir: Path,
+    complete: list[DiscoveredItem],
+    all_pairs: dict[str, dict[int, BatchVideo]],
+) -> dict[str, dict[int, str]]:
+    """Add manifest items whose videos are not on disk yet; return the artifact map.
+
+    Manifest rows come from bgm_explainer_pipeline.py: {item_id, slug,
+    video_artifact_script1, video_artifact_script2, ...}. Videos for these items
+    are downloaded on demand inside prepare_item, so the run does not wait for a
+    bulk download before starting.
+    """
+    artifact_map: dict[str, dict[int, str]] = {}
+    added = 0
+    offset = 1_000_000  # keep disk-discovered items first in first_seen order
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            item_id = rec.get("item_id")
+            aid1 = rec.get("video_artifact_script1")
+            aid2 = rec.get("video_artifact_script2")
+            if not item_id or not aid1 or not aid2:
+                continue
+            artifact_map[item_id] = {1: aid1, 2: aid2}
+            existing = all_pairs.get(item_id)
+            if existing and 1 in existing and 2 in existing:
+                continue
+            slug = rec.get("slug") or "Product"
+            pair = {
+                si: BatchVideo(
+                    item_id, si, slug,
+                    batch_dir / f"{item_id}_{slug}_script{si}_{slug}.mp4",
+                )
+                for si in (1, 2)
+            }
+            all_pairs[item_id] = pair
+            complete.append(DiscoveredItem(item_id=item_id, pair=pair, first_seen=offset + index))
+            added += 1
+    if added:
+        print(f"Manifest added {added} item(s) pending video download.", flush=True)
+    return artifact_map
 
 
 def select_items(
@@ -1094,8 +1165,9 @@ def fetch_tags(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Single batch call to tag_matcher; returns (tag_windows, bridge_points).
 
-    Builds one item per dialogue chunk ([:4] and [4:] per video) plus one item
-    covering all dialogues for the bridge overlay. script_id is used to match
+    Splits each video's dialogues in half (by dialogue count) into two chunks,
+    so two videos yield four chunk items, plus one item covering all dialogues
+    for the bridge overlay -> five items total. script_id is used to match
     results back to their chunk.
     """
     # script_id -> (video_index, start_sec, end_sec)  for tag_window chunks
@@ -1107,7 +1179,9 @@ def fetch_tags(
         dialogues = _parse_ass_dialogues(ass_path)
         if not dialogues:
             continue
-        for chunk in [dialogues[:4], dialogues[4:]]:
+        # Split this script in half; the first half takes the extra line when odd.
+        mid = (len(dialogues) + 1) // 2
+        for chunk in [dialogues[:mid], dialogues[mid:]]:
             if not chunk:
                 continue
             items.append({
@@ -1175,11 +1249,11 @@ def run_command(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] 
     return result.returncode, result.stdout.strip()
 
 
-def trim_video(src: Path, dst: Path, *, force: bool) -> None:
+def trim_video(src: Path, dst: Path, *, force: bool, tail_seconds: float = 1.0) -> None:
     if dst.exists() and not force:
         return
     duration = media_duration(src)
-    trimmed_duration = max(duration - 1.0, 0.1)
+    trimmed_duration = max(duration - tail_seconds, 0.1)
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg",
@@ -1446,6 +1520,16 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
         if 1 not in pair or 2 not in pair:
             raise RuntimeError("missing pair")
 
+        artifact_ids = ctx.artifact_map.get(item_id)
+        if artifact_ids:
+            _t_download = time.monotonic()
+            for script_index in (1, 2):
+                video = pair[script_index]
+                artifact_id = artifact_ids.get(script_index)
+                if artifact_id and not (video.path.exists() and video.path.stat().st_size > 0):
+                    download_artifact(artifact_id, video.path)
+            row["time_video_download_s"] = round(time.monotonic() - _t_download, 2)
+
         script_record = ctx.script_records.get(item_id)
         if script_record is None or script_record.record is None:
             raise RuntimeError(script_record.error if script_record else "missing script record")
@@ -1472,7 +1556,7 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
             trim_started = time.monotonic()
             src = pair[script_index].path
             dst = args.trimmed_video_dir / src.name
-            trim_video(src, dst, force=args.force_trim)
+            trim_video(src, dst, force=args.force_trim, tail_seconds=args.trim_tail_seconds)
             time_trim = time.monotonic() - trim_started
 
             ass_started = time.monotonic()
@@ -1614,28 +1698,48 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
 
         # Resolve images from picker result
         _t = time.monotonic()
+        slot_layout = (ctx.timeline_config.get("defaults") or {}).get("image_slot_layout", "")
         if http_urls:
             if image_picker_api_result is not None:
                 hero_url = image_picker_api_result.get("hero_image_url", "")
                 s1_urls = image_picker_api_result.get("script1_image_urls", [])
                 s2_urls = image_picker_api_result.get("script2_image_urls", [])
-                # Slot order matches image_index convention:
-                # [0] hero, [1] script-1 image, [2] script-2 image.
-                # Only the first picked image per script is used; s1[1]/s2[1] are intentionally dropped.
-                url_slots = [
-                    hero_url,
-                    s1_urls[0] if s1_urls else "",
-                    s2_urls[0] if s2_urls else "",
-                ]
-                picked: list[Path] = []
-                for slot_url in url_slots:
-                    if not slot_url:
-                        continue
-                    resolved = download_image_url(slot_url, item_id, args.image_cache_dir)
-                    if resolved:
-                        picked.append(resolved)
-                if len(picked) >= 2:
-                    images = picked
+                if slot_layout == "per_script_pair":
+                    # Slot order: [0] hero, [1][2] script-1 picks, [3][4] script-2 picks.
+                    # Slot positions are semantic (configs index into them), so a
+                    # missing or failed slot is backfilled with another resolved
+                    # image instead of dropped, to keep indices stable.
+                    def script_pair(urls: list[str]) -> list[str]:
+                        if not urls:
+                            return ["", ""]
+                        return [urls[0], urls[1] if len(urls) > 1 else urls[0]]
+
+                    url_slots = [hero_url, *script_pair(s1_urls), *script_pair(s2_urls)]
+                    resolved_slots = [
+                        download_image_url(slot_url, item_id, args.image_cache_dir) if slot_url else None
+                        for slot_url in url_slots
+                    ]
+                    backfill = next((path for path in resolved_slots if path is not None), None)
+                    if backfill is not None:
+                        images = [path if path is not None else backfill for path in resolved_slots]
+                else:
+                    # Slot order matches image_index convention:
+                    # [0] hero, [1] script-1 image, [2] script-2 image.
+                    # Only the first picked image per script is used; s1[1]/s2[1] are intentionally dropped.
+                    url_slots = [
+                        hero_url,
+                        s1_urls[0] if s1_urls else "",
+                        s2_urls[0] if s2_urls else "",
+                    ]
+                    picked: list[Path] = []
+                    for slot_url in url_slots:
+                        if not slot_url:
+                            continue
+                        resolved = download_image_url(slot_url, item_id, args.image_cache_dir)
+                        if resolved:
+                            picked.append(resolved)
+                    if len(picked) >= 2:
+                        images = picked
             if len(images) < expected_images:
                 images.extend(
                     download_selected_http_images(
@@ -1704,6 +1808,11 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
             if clean_tl.get("products"):
                 clean_tl["products"][0]["tag_windows"] = tag_windows
                 clean_tl["products"][0]["bridge_overlay_points"] = bridge_points
+                # Verification context: everything the pickers had to choose from,
+                # plus the raw picker output, so tag/image selections can be audited.
+                clean_tl["products"][0]["available_attributes"] = attributes
+                clean_tl["products"][0]["available_image_urls"] = http_urls
+                clean_tl["products"][0]["image_picker_result"] = image_picker_api_result
             clean_timeline_path.write_text(json.dumps(clean_tl, indent=2) + "\n", encoding="utf-8")
 
         # Tentative status; render_step will overwrite to FAIL if render breaks.
@@ -1791,7 +1900,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-dir", required=True, type=Path)
     parser.add_argument("--json-dir", required=True, type=Path)
     parser.add_argument("--image-tsv", required=True, type=Path)
-    parser.add_argument("--image-cache-dir", default="outputs/image_cache", type=Path)
+    parser.add_argument("--image-cache-dir", default="output/samples/image_cache", type=Path)
     parser.add_argument("--style", required=True, type=Path)
     parser.add_argument("--timeline-config", required=True, type=Path)
     parser.add_argument("--ass-dir", required=True, type=Path)
@@ -1882,6 +1991,10 @@ def parse_args() -> argparse.Namespace:
         help="Full stable-ts command template using {input} and {output}, overriding --stable-ts-cmd/--stable-ts-arg.",
     )
     parser.add_argument("--itm-list", help="Allowlist as comma-separated ITMs or a text file path.")
+    parser.add_argument("--manifest-jsonl", type=Path, default=None,
+                        help="Manifest from bgm_explainer_pipeline.py; items listed there are "
+                             "processed even if their videos are not in --batch-dir yet — the "
+                             "videos are downloaded from the artifacts service during the run.")
     parser.add_argument("--expected-images", default=None, type=positive_int)
     parser.add_argument("--scan-full-tsv", action="store_true")
     parser.add_argument(
@@ -1893,6 +2006,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-tsv-index", action="store_true", help="Force rebuild of the TSV index even if it is up to date.")
     parser.add_argument("--force-ass", action="store_true")
     parser.add_argument("--force-trim", action="store_true")
+    parser.add_argument("--trim-tail-seconds", type=float, default=0,
+                        help="Seconds to trim off the end of each source video before "
+                             "stitching (default 0.0). Pass 0 to keep the last second.")
+    parser.add_argument("--no-trim-tail", dest="trim_tail_seconds", action="store_const",
+                        const=0.0,
+                        help="Shortcut for --trim-tail-seconds 0; do not trim the last second.")
     parser.add_argument("--force-render", action="store_true", help="Re-render items even if the stitched output video already exists.")
     parser.add_argument("--force-rebuild-timeline", action="store_true", help="Rebuild timeline + clean ASS + tag windows even if <ITM>.clean.json already exists.")
     parser.add_argument("--skip-render", action="store_true")
@@ -1949,6 +2068,15 @@ def main() -> int:
 
     allowlist = parse_itm_list(args.itm_list)
     complete, all_pairs = discover_batch_items(args.batch_dir)
+
+    artifact_map: dict[str, dict[int, str]] = {}
+    if args.manifest_jsonl:
+        manifest_path = resolve_existing_path(args.manifest_jsonl)
+        if not manifest_path.exists():
+            print(f"ERROR: --manifest-jsonl does not exist: {manifest_path}", file=sys.stderr)
+            return 2
+        artifact_map = merge_manifest_items(manifest_path, args.batch_dir, complete, all_pairs)
+        complete.sort(key=lambda item: item.first_seen)
 
     if not args.force_render:
         kept: list[DiscoveredItem] = []
@@ -2061,6 +2189,7 @@ def main() -> int:
         ass_semaphore=threading.Semaphore(n_workers),
         ass_pool=ass_pool,
         tsv_index_load_s=tsv_index_load_s,
+        artifact_map=artifact_map,
     )
 
     rows_by_id: dict[str, dict[str, Any]] = {}
