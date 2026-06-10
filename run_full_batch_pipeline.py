@@ -129,6 +129,8 @@ REPORT_FIELDS = [
     "time_timeline_clean_ass_s",
     "time_tag_windows_s",
     "time_render_s",
+    "time_render_cpu_s",
+    "time_render_cpu_pct",
 ]
 
 

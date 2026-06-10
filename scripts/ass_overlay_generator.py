@@ -1656,9 +1656,14 @@ def highlight_pip_events(
                 filtered_items = _filter_overlay_gradient_items([(lbl, val)])
                 if filtered_items:
                     valid_tags.append(filtered_items[0])
-            for j, (lbl, val) in enumerate(valid_tags):
+            # At most 2 tags per window; pull a late item back so it still
+            # gets its full display before the scene ends (slots stack, so
+            # overlapping items render in separate rows).
+            for j, (lbl, val) in enumerate(valid_tags[:2]):
                 item_t = t + j * item_dur
-                if item_t >= scene_dur:
+                if item_t + item_dur > scene_dur:
+                    item_t = max(t, scene_dur - item_dur)
+                if item_t + item_dur > scene_dur:
                     break
                 tw_items.append((lbl, val))
                 tw_starts.append(item_t)
