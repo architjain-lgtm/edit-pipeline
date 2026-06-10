@@ -44,8 +44,9 @@ DB_PORT = int(os.environ.get("MINIVET_DB_PORT", "30432"))
 DB_USER = os.environ.get("MINIVET_DB_USER", "minivet_ro_user")
 DB_PASSWORD = os.environ.get("MINIVET_DB_PASSWORD", "")
 
+ARTIFACT_URL = "http://10.12.46.7:30080/artifacts/{artifact_id}/file?tenant_id=Flipkart"
+
 EXPLAINER_TAG = '{"role": "explainer"}'
-APPROVED_STATUS = "auto_qc_approved"
 CHUNK = 2000
 
 
@@ -63,6 +64,26 @@ def slugify(value: str) -> str:
     if not cleaned:
         return "Product"
     return "".join(part[:1].upper() + part[1:] for part in cleaned.split(" "))
+
+
+def fix_mojibake(value: str) -> str:
+    """Repair UTF-8 text that was stored as latin-1 (e.g. 'â€“' -> '–')."""
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+
+
+def attributes_from_description(description: str) -> dict[str, str]:
+    """products.description for explainer products is 'key: value | key: value'."""
+    out: dict[str, str] = {}
+    for part in (description or "").split(" | "):
+        if ": " in part:
+            key, value = part.split(": ", 1)
+            key, value = key.strip(), fix_mojibake(value.strip())
+            if key and value:
+                out[key] = value
+    return out
 
 
 def chunked(seq: list, size: int):
@@ -97,13 +118,16 @@ def run_chunked(database: str, ids: list, run_chunk) -> None:
 
 
 # --- DB resolution ------------------------------------------------------------
-def fetch_products(itm_ids: list[str]) -> dict[str, dict[str, str]]:
-    out: dict[str, dict[str, str]] = {}
+def fetch_products(itm_ids: list[str]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
 
     def run_chunk(conn, chunk):
         rows = conn.run(
             """
             SELECT external_id,
+                   product_id,
+                   title,
+                   description,
                    product_metadata->'category'->>'analytic_vertical',
                    product_metadata->'category'->>'analytic_super_category'
             FROM public.products
@@ -111,16 +135,52 @@ def fetch_products(itm_ids: list[str]) -> dict[str, dict[str, str]]:
             """,
             ids=chunk,
         )
-        for itm, vertical, sc in rows:
-            out[itm] = {"vertical": vertical or "", "super_category": sc or ""}
+        for itm, uuid, title, description, vertical, sc in rows:
+            out[itm] = {
+                "product_uuid": str(uuid),
+                "title": fix_mojibake((title or "").strip()),
+                "attributes": attributes_from_description(description or ""),
+                "vertical": vertical or "",
+                "super_category": sc or "",
+            }
 
     run_chunked("orchestrator", itm_ids, run_chunk)
     print(f"  products: {len(out)}/{len(itm_ids)} resolved", flush=True)
     return out
 
 
+def fetch_product_images(products: dict[str, dict[str, Any]]) -> dict[str, list[str]]:
+    """ITM -> ordered artifact download URLs from orchestrator.product_images."""
+    uuid_to_itm = {p["product_uuid"]: itm for itm, p in products.items()}
+    collected: dict[str, list[tuple[int, str]]] = {}
+
+    def run_chunk(conn, chunk):
+        rows = conn.run(
+            """
+            SELECT product_id,
+                   artifact_id,
+                   COALESCE((image_metadata->>'image_order')::int, 0)
+            FROM public.product_images
+            WHERE product_id = ANY(CAST(:ids AS uuid[]))
+            """,
+            ids=chunk,
+        )
+        for uuid, artifact_id, order in rows:
+            itm = uuid_to_itm.get(str(uuid))
+            if itm and artifact_id:
+                collected.setdefault(itm, []).append((order, artifact_id))
+
+    run_chunked("orchestrator", sorted(uuid_to_itm), run_chunk)
+    out = {
+        itm: [ARTIFACT_URL.format(artifact_id=aid) for _order, aid in sorted(pairs)]
+        for itm, pairs in collected.items()
+    }
+    print(f"  images: {len(out)} items with product_images", flush=True)
+    return out
+
+
 def fetch_approved_rows(itm_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
-    """ITM -> approved explainer rows (newest first) with video + script ids."""
+    """ITM -> explainer video rows (newest first, any review status) with video + script ids."""
     out: dict[str, list[dict[str, Any]]] = {}
 
     def run_chunk(conn, chunk):
@@ -129,13 +189,11 @@ def fetch_approved_rows(itm_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
             SELECT product_id, item_id, item_payload
             FROM public.items
             WHERE product_id = ANY(:ids)
-              AND review_status = :status
               AND tags = CAST(:tag AS jsonb)
               AND review_type = 'EXPLAINER_VIDEO'
             ORDER BY product_id, item_id DESC
             """,
             ids=chunk,
-            status=APPROVED_STATUS,
             tag=EXPLAINER_TAG,
         )
         for itm, _row_id, payload in rows:
@@ -183,17 +241,22 @@ def fetch_scripts(pdis: list[str]) -> dict[str, dict[str, Any]]:
 def resolve(itm_ids: list[str], manifest_path: Path) -> list[dict[str, Any]]:
     print(f"Resolving {len(itm_ids)} items from DB ...", flush=True)
     products = fetch_products(itm_ids)
+    images = fetch_product_images(products)
     approved = fetch_approved_rows(itm_ids)
     all_pdis = sorted({r["script_product_data_id"]
                        for rows in approved.values() for r in rows})
     scripts = fetch_scripts(all_pdis)
 
     records: list[dict[str, Any]] = []
-    skipped = {"no_product": 0, "lt2_rows": 0, "no_script_pair": 0}
+    skipped = {"no_product": 0, "no_images": 0, "lt2_rows": 0, "no_script_pair": 0}
     for itm in itm_ids:
         product = products.get(itm)
         if not product:
             skipped["no_product"] += 1
+            continue
+        image_urls = images.get(itm) or []
+        if not image_urls:
+            skipped["no_images"] += 1
             continue
         rows = approved.get(itm) or []
         if len(rows) < 2:
@@ -221,6 +284,9 @@ def resolve(itm_ids: list[str], manifest_path: Path) -> list[dict[str, Any]]:
             "item_id": itm,
             "slug": slugify(product["vertical"]),
             "super_category": product["super_category"],
+            "title": product["title"],
+            "attributes": product["attributes"],
+            "image_urls": image_urls,
             "script1": by_index[1]["script_text"],
             "script2": by_index[2]["script_text"],
             "video_artifact_script1": by_index[1]["video_artifact_id"],
@@ -253,8 +319,9 @@ def main() -> int:
                         help="Ignore an existing manifest.jsonl and hit the DB again.")
     parser.add_argument("--resolve-only", action="store_true",
                         help="Write manifest + scripts.jsonl and stop.")
-    # pipeline inputs kept exactly as before
-    parser.add_argument("--image-tsv", type=Path, default=Path("bgmh_enriched.tsv"))
+    parser.add_argument("--image-tsv", type=Path, default=None,
+                        help="Optional fallback image TSV; by default images come "
+                             "from product_images via the manifest.")
     parser.add_argument("--style", type=Path, default=Path("scripts/global_style.json"))
     parser.add_argument("--timeline-config", type=Path,
                         default=Path("scripts/timeline_generation_config.json"))
@@ -303,7 +370,7 @@ def main() -> int:
         "--batch-dir", str(batch_dir),
         "--json-dir", str(scripts_dir),
         "--manifest-jsonl", str(manifest_path),
-        "--image-tsv", str(args.image_tsv),
+        *(["--image-tsv", str(args.image_tsv)] if args.image_tsv else []),
         "--style", str(args.style),
         "--timeline-config", str(args.timeline_config),
         "--ass-dir", str(out_dir / "ass"),
