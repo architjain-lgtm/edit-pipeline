@@ -1433,6 +1433,12 @@ def _match_bullets_to_subtitle_windows(
     return windows or None
 
 
+def _truncate_highlight_text(text: str, max_chars: int = 13) -> str:
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "..."
+
+
 def _emit_highlight_items(
     items: list[tuple[str, str]],
     evt_start: float,
@@ -1469,8 +1475,8 @@ def _emit_highlight_items(
     for idx, (lbl, val) in enumerate(capped):
         label_y = first_label_y + idx * row_gap
         value_y = label_y + label_value_gap
-        lbl = lbl.replace("_", " ").upper() if lbl else ""
-        val = val.replace("_", " ").upper() if val else ""
+        lbl = _truncate_highlight_text(lbl.replace("_", " ").upper()) if lbl else ""
+        val = _truncate_highlight_text(val.replace("_", " ").upper()) if val else ""
         fad = f"\\fad({slide_ms},{slide_out_ms})"
         if lbl and val:
             events.append(dialogue(evt_start, evt_end, label_style, positioned_text(x, label_y, lbl, fad), layer=24))
