@@ -1553,6 +1553,7 @@ def highlight_pip_events(
     chunk_size: int = 2,
     delay_override: float | None = None,
     _gradient_windows: list[GradientWindow] | None = None,
+    sibling_scenes: list[dict[str, Any]] | None = None,
 ) -> list[str]:
     layout = style.get("layout_presets", {}).get("product_highlight_pip", {})
     text_cfg = layout.get("text", {})
@@ -1632,11 +1633,40 @@ def highlight_pip_events(
             ))
 
     # --- tag_windows path: pre-computed audio-synced windows ---
+    _BURN_SCENE_TYPES = {"product_highlight_pip_scene", "product_highlight_pip_scene_with_gradient_overlay"}
     tag_windows = sorted(
         [w for w in product.get("tag_windows", []) if w.get("video_index") == video_idx],
         key=lambda w: w["start_sec"],
     )
-    if tag_windows and scene.get("type") in {"product_highlight_pip_scene", "product_highlight_pip_scene_with_gradient_overlay"}:
+    had_tag_windows = bool(tag_windows)
+    if tag_windows and sibling_scenes and scene.get("type") in _BURN_SCENE_TYPES:
+        # Assign each window to exactly one eligible scene so a window that
+        # spans a scene boundary doesn't burn into every scene it overlaps
+        # (duplicate, overlapping rows). A window belongs to the last eligible
+        # scene starting at or before it; windows that start before all
+        # eligible scenes belong to the first one.
+        eligible = sorted(
+            [
+                s for s in sibling_scenes
+                if s.get("type") in _BURN_SCENE_TYPES
+                and int(s.get("talking_head_video_index", s.get("video_index", 0))) == video_idx
+            ],
+            key=scene_source_start,
+        )
+        if eligible:
+            def _owner(w: dict[str, Any]) -> dict[str, Any]:
+                owner = eligible[0]
+                for s in eligible:
+                    if scene_source_start(s) <= float(w["start_sec"]):
+                        owner = s
+                return owner
+
+            tag_windows = [w for w in tag_windows if _owner(w) is scene]
+    if had_tag_windows and scene.get("type") in _BURN_SCENE_TYPES:
+        if not tag_windows:
+            # This video has tag windows, but they all belong to sibling
+            # scenes — no highlight overlay here.
+            return []
         tw_items: list[tuple[str, str]] = []
         tw_starts: list[float] = []
         for w in tag_windows:
@@ -1896,7 +1926,7 @@ def generated_events(
         if scene_type in {"product_highlight_pip_scene", "product_highlight_pip_scene_with_gradient_overlay", "product_pip_head_exit_scene"} and product:
             key = (scene_type, str(pid), float(scene["start"]), float(scene["end"]))
             if key not in seen_product_scene_keys:
-                events.extend(highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=not heading_shown, _gradient_windows=_gradient_windows))
+                events.extend(highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=not heading_shown, _gradient_windows=_gradient_windows, sibling_scenes=scenes))
                 heading_shown = True
                 seen_product_scene_keys.add(key)
         elif scene_type == "product_bridge_gradient_overlay" and product:
@@ -1914,6 +1944,7 @@ def generated_events(
                     chunk_size=1,
                     delay_override=0.0,
                     _gradient_windows=_gradient_windows,
+                    sibling_scenes=scenes,
                 ))
                 seen_product_scene_keys.add(key)
         elif scene_type in PRODUCT_SCENE_TYPES and product:
@@ -2007,7 +2038,7 @@ def collect_gradient_windows(
         if scene_type in {"product_highlight_pip_scene", "product_highlight_pip_scene_with_gradient_overlay", "product_pip_head_exit_scene"} and product:
             key = (scene_type, str(pid), float(scene["start"]), float(scene["end"]))
             if key not in seen_product_scene_keys:
-                highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=not heading_shown, _gradient_windows=windows)
+                highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=not heading_shown, _gradient_windows=windows, sibling_scenes=scenes)
                 heading_shown = True
                 seen_product_scene_keys.add(key)
         elif scene_type == "product_bridge_gradient_overlay" and product:
@@ -2018,7 +2049,7 @@ def collect_gradient_windows(
         elif scene_type in AUDIO_OVERLAY_SCENE_TYPES and product:
             key = (scene_type, str(pid), float(scene["start"]), float(scene["end"]))
             if key not in seen_product_scene_keys:
-                highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=False, chunk_size=1, delay_override=0.0, _gradient_windows=windows)
+                highlight_pip_events(scene, product, style, subtitle_asses=subtitle_asses, show_heading=False, chunk_size=1, delay_override=0.0, _gradient_windows=windows, sibling_scenes=scenes)
                 seen_product_scene_keys.add(key)
 
     return windows
