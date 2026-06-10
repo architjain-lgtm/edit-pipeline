@@ -1617,28 +1617,48 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
 
         # Resolve images from picker result
         _t = time.monotonic()
+        slot_layout = (ctx.timeline_config.get("defaults") or {}).get("image_slot_layout", "")
         if http_urls:
             if image_picker_api_result is not None:
                 hero_url = image_picker_api_result.get("hero_image_url", "")
                 s1_urls = image_picker_api_result.get("script1_image_urls", [])
                 s2_urls = image_picker_api_result.get("script2_image_urls", [])
-                # Slot order matches image_index convention:
-                # [0] hero, [1] script-1 image, [2] script-2 image.
-                # Only the first picked image per script is used; s1[1]/s2[1] are intentionally dropped.
-                url_slots = [
-                    hero_url,
-                    s1_urls[0] if s1_urls else "",
-                    s2_urls[0] if s2_urls else "",
-                ]
-                picked: list[Path] = []
-                for slot_url in url_slots:
-                    if not slot_url:
-                        continue
-                    resolved = download_image_url(slot_url, item_id, args.image_cache_dir)
-                    if resolved:
-                        picked.append(resolved)
-                if len(picked) >= 2:
-                    images = picked
+                if slot_layout == "per_script_pair":
+                    # Slot order: [0] hero, [1][2] script-1 picks, [3][4] script-2 picks.
+                    # Slot positions are semantic (configs index into them), so a
+                    # missing or failed slot is backfilled with another resolved
+                    # image instead of dropped, to keep indices stable.
+                    def script_pair(urls: list[str]) -> list[str]:
+                        if not urls:
+                            return ["", ""]
+                        return [urls[0], urls[1] if len(urls) > 1 else urls[0]]
+
+                    url_slots = [hero_url, *script_pair(s1_urls), *script_pair(s2_urls)]
+                    resolved_slots = [
+                        download_image_url(slot_url, item_id, args.image_cache_dir) if slot_url else None
+                        for slot_url in url_slots
+                    ]
+                    backfill = next((path for path in resolved_slots if path is not None), None)
+                    if backfill is not None:
+                        images = [path if path is not None else backfill for path in resolved_slots]
+                else:
+                    # Slot order matches image_index convention:
+                    # [0] hero, [1] script-1 image, [2] script-2 image.
+                    # Only the first picked image per script is used; s1[1]/s2[1] are intentionally dropped.
+                    url_slots = [
+                        hero_url,
+                        s1_urls[0] if s1_urls else "",
+                        s2_urls[0] if s2_urls else "",
+                    ]
+                    picked: list[Path] = []
+                    for slot_url in url_slots:
+                        if not slot_url:
+                            continue
+                        resolved = download_image_url(slot_url, item_id, args.image_cache_dir)
+                        if resolved:
+                            picked.append(resolved)
+                    if len(picked) >= 2:
+                        images = picked
             if len(images) < expected_images:
                 images.extend(
                     download_selected_http_images(
@@ -1901,9 +1921,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-tsv-index", action="store_true", help="Force rebuild of the TSV index even if it is up to date.")
     parser.add_argument("--force-ass", action="store_true")
     parser.add_argument("--force-trim", action="store_true")
-    parser.add_argument("--trim-tail-seconds", type=float, default=1.0,
+    parser.add_argument("--trim-tail-seconds", type=float, default=0,
                         help="Seconds to trim off the end of each source video before "
-                             "stitching (default 1.0). Pass 0 to keep the last second.")
+                             "stitching (default 0.0). Pass 0 to keep the last second.")
     parser.add_argument("--no-trim-tail", dest="trim_tail_seconds", action="store_const",
                         const=0.0,
                         help="Shortcut for --trim-tail-seconds 0; do not trim the last second.")
