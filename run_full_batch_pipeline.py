@@ -479,15 +479,20 @@ def merge_manifest_items(
     batch_dir: Path,
     complete: list[DiscoveredItem],
     all_pairs: dict[str, dict[int, BatchVideo]],
-) -> dict[str, dict[int, str]]:
-    """Add manifest items whose videos are not on disk yet; return the artifact map.
+) -> tuple[dict[str, dict[int, str]], dict[str, TsvItemData]]:
+    """Add manifest items whose videos are not on disk yet.
 
-    Manifest rows come from bgm_explainer_pipeline.py: {item_id, slug,
-    video_artifact_script1, video_artifact_script2, ...}. Videos for these items
-    are downloaded on demand inside prepare_item, so the run does not wait for a
-    bulk download before starting.
+    Manifest rows come from bgm_explainer_pipeline.py: {item_id, slug, title,
+    attributes, image_urls, video_artifact_script1, video_artifact_script2, ...}.
+    Returns (artifact_map, manifest_data):
+      artifact_map  — item_id -> {script_index: artifact_id}; videos download on
+                      demand inside prepare_item.
+      manifest_data — item_id -> TsvItemData built from the manifest's title,
+                      attributes and product_images URLs; replaces the image-TSV
+                      row for these items.
     """
     artifact_map: dict[str, dict[int, str]] = {}
+    manifest_data: dict[str, TsvItemData] = {}
     added = 0
     offset = 1_000_000  # keep disk-discovered items first in first_seen order
     with manifest_path.open("r", encoding="utf-8") as handle:
@@ -502,6 +507,18 @@ def merge_manifest_items(
             if not item_id or not aid1 or not aid2:
                 continue
             artifact_map[item_id] = {1: aid1, 2: aid2}
+            image_urls = [url for url in (rec.get("image_urls") or []) if url]
+            if image_urls:
+                record = {
+                    "item_id": item_id,
+                    "title": rec.get("title") or "",
+                    # JSON string: attributes_from_record/attributes_from_tsv_record
+                    # both json.loads this field.
+                    "attributes": json.dumps(rec.get("attributes") or {}, ensure_ascii=False),
+                }
+                manifest_data[item_id] = TsvItemData(
+                    images=[], record=record, raw_images=image_urls,
+                )
             existing = all_pairs.get(item_id)
             if existing and 1 in existing and 2 in existing:
                 continue
@@ -518,7 +535,10 @@ def merge_manifest_items(
             added += 1
     if added:
         print(f"Manifest added {added} item(s) pending video download.", flush=True)
-    return artifact_map
+    if manifest_data:
+        print(f"Manifest provides images/attributes for {len(manifest_data)} item(s).",
+              flush=True)
+    return artifact_map, manifest_data
 
 
 def select_items(
@@ -1899,7 +1919,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the full paired-video batch pipeline for selected ITMs.")
     parser.add_argument("--batch-dir", required=True, type=Path)
     parser.add_argument("--json-dir", required=True, type=Path)
-    parser.add_argument("--image-tsv", required=True, type=Path)
+    parser.add_argument("--image-tsv", default=None, type=Path,
+                        help="Image/attribute TSV. Optional when --manifest-jsonl "
+                             "carries image_urls + attributes; then only items the "
+                             "manifest does not cover fall back to the TSV.")
     parser.add_argument("--image-cache-dir", default="output/samples/image_cache", type=Path)
     parser.add_argument("--style", required=True, type=Path)
     parser.add_argument("--timeline-config", required=True, type=Path)
@@ -2034,7 +2057,7 @@ def parse_args() -> argparse.Namespace:
 
     args.batch_dir = resolve_existing_path(args.batch_dir)
     args.json_dir = resolve_existing_path(args.json_dir)
-    args.image_tsv = resolve_existing_path(args.image_tsv)
+    args.image_tsv = resolve_existing_path(args.image_tsv) if args.image_tsv else None
     args.image_cache_dir = resolve_output_path(args.image_cache_dir)
     args.style = resolve_existing_path(args.style, search_code_dir=True)
     args.timeline_config = resolve_existing_path(args.timeline_config, search_code_dir=True)
@@ -2053,9 +2076,14 @@ def main() -> int:
     args = parse_args()
     for label in ["batch_dir", "json_dir", "image_tsv", "style", "timeline_config"]:
         path = getattr(args, label)
+        if path is None:
+            continue
         if not path.exists():
             print(f"ERROR: --{label.replace('_', '-')} does not exist: {path}", file=sys.stderr)
             return 2
+    if args.image_tsv is None and not args.manifest_jsonl:
+        print("ERROR: provide --image-tsv or a --manifest-jsonl with image_urls.", file=sys.stderr)
+        return 2
 
     timeline_config = load_timeline_config(args.timeline_config)
     timeline_defaults = timeline_config.get("defaults", {})
@@ -2070,12 +2098,13 @@ def main() -> int:
     complete, all_pairs = discover_batch_items(args.batch_dir)
 
     artifact_map: dict[str, dict[int, str]] = {}
+    manifest_data: dict[str, TsvItemData] = {}
     if args.manifest_jsonl:
         manifest_path = resolve_existing_path(args.manifest_jsonl)
         if not manifest_path.exists():
             print(f"ERROR: --manifest-jsonl does not exist: {manifest_path}", file=sys.stderr)
             return 2
-        artifact_map = merge_manifest_items(manifest_path, args.batch_dir, complete, all_pairs)
+        artifact_map, manifest_data = merge_manifest_items(manifest_path, args.batch_dir, complete, all_pairs)
         complete.sort(key=lambda item: item.first_seen)
 
     if not args.force_render:
@@ -2108,26 +2137,38 @@ def main() -> int:
         flush=True,
     )
     _tsv_t = time.monotonic()
-    if args.tsv_index:
-        tsv_index = load_or_build_tsv_index(args.image_tsv, args.tsv_index, force_rebuild=args.rebuild_tsv_index)
-        tsv_data = resolve_from_index(
-            tsv_index,
-            selected_ids,
-            args.expected_images,
-            tsv_path=args.image_tsv,
-            image_cache_dir=args.image_cache_dir,
-            scan_full_tsv=args.scan_full_tsv,
-        )
-    else:
-        tsv_data = stream_selected_tsv(
-            args.image_tsv,
-            selected_ids,
-            args.expected_images,
-            scan_full_tsv=args.scan_full_tsv,
-            image_cache_dir=args.image_cache_dir,
-        )
+    tsv_data: dict[str, TsvItemData] = {
+        item_id: manifest_data[item_id] for item_id in selected_ids if item_id in manifest_data
+    }
+    uncovered_ids = [item_id for item_id in selected_ids if item_id not in tsv_data]
+    if tsv_data:
+        print(f"Using manifest images/attributes for {len(tsv_data)} of "
+              f"{len(selected_ids)} selected item(s).", flush=True)
+    if uncovered_ids:
+        if args.image_tsv is None:
+            print(f"WARNING: {len(uncovered_ids)} selected item(s) have no manifest "
+                  f"images and no --image-tsv was given; they will fail with "
+                  f"'zero images'.", flush=True)
+        elif args.tsv_index:
+            tsv_index = load_or_build_tsv_index(args.image_tsv, args.tsv_index, force_rebuild=args.rebuild_tsv_index)
+            tsv_data.update(resolve_from_index(
+                tsv_index,
+                uncovered_ids,
+                args.expected_images,
+                tsv_path=args.image_tsv,
+                image_cache_dir=args.image_cache_dir,
+                scan_full_tsv=args.scan_full_tsv,
+            ))
+        else:
+            tsv_data.update(stream_selected_tsv(
+                args.image_tsv,
+                uncovered_ids,
+                args.expected_images,
+                scan_full_tsv=args.scan_full_tsv,
+                image_cache_dir=args.image_cache_dir,
+            ))
     tsv_index_load_s = round(time.monotonic() - _tsv_t, 2)
-    print(f"TSV data loaded in {tsv_index_load_s:.2f}s.", flush=True)
+    print(f"Image/attribute data loaded in {tsv_index_load_s:.2f}s.", flush=True)
     print("Loading selected script records.", flush=True)
     script_records = load_selected_script_records(args.json_dir, selected_ids)
     print("Script records loaded.", flush=True)
