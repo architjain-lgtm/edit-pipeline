@@ -1094,8 +1094,9 @@ def fetch_tags(
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Single batch call to tag_matcher; returns (tag_windows, bridge_points).
 
-    Builds one item per dialogue chunk ([:4] and [4:] per video) plus one item
-    covering all dialogues for the bridge overlay. script_id is used to match
+    Splits each video's dialogues in half (by dialogue count) into two chunks,
+    so two videos yield four chunk items, plus one item covering all dialogues
+    for the bridge overlay -> five items total. script_id is used to match
     results back to their chunk.
     """
     # script_id -> (video_index, start_sec, end_sec)  for tag_window chunks
@@ -1107,7 +1108,9 @@ def fetch_tags(
         dialogues = _parse_ass_dialogues(ass_path)
         if not dialogues:
             continue
-        for chunk in [dialogues[:4], dialogues[4:]]:
+        # Split this script in half; the first half takes the extra line when odd.
+        mid = (len(dialogues) + 1) // 2
+        for chunk in [dialogues[:mid], dialogues[mid:]]:
             if not chunk:
                 continue
             items.append({
@@ -1175,11 +1178,11 @@ def run_command(cmd: list[str], *, cwd: Path | None = None, env: dict[str, str] 
     return result.returncode, result.stdout.strip()
 
 
-def trim_video(src: Path, dst: Path, *, force: bool) -> None:
+def trim_video(src: Path, dst: Path, *, force: bool, tail_seconds: float = 1.0) -> None:
     if dst.exists() and not force:
         return
     duration = media_duration(src)
-    trimmed_duration = max(duration - 1.0, 0.1)
+    trimmed_duration = max(duration - tail_seconds, 0.1)
     dst.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         "ffmpeg",
@@ -1472,7 +1475,7 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
             trim_started = time.monotonic()
             src = pair[script_index].path
             dst = args.trimmed_video_dir / src.name
-            trim_video(src, dst, force=args.force_trim)
+            trim_video(src, dst, force=args.force_trim, tail_seconds=args.trim_tail_seconds)
             time_trim = time.monotonic() - trim_started
 
             ass_started = time.monotonic()
@@ -1704,6 +1707,11 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
             if clean_tl.get("products"):
                 clean_tl["products"][0]["tag_windows"] = tag_windows
                 clean_tl["products"][0]["bridge_overlay_points"] = bridge_points
+                # Verification context: everything the pickers had to choose from,
+                # plus the raw picker output, so tag/image selections can be audited.
+                clean_tl["products"][0]["available_attributes"] = attributes
+                clean_tl["products"][0]["available_image_urls"] = http_urls
+                clean_tl["products"][0]["image_picker_result"] = image_picker_api_result
             clean_timeline_path.write_text(json.dumps(clean_tl, indent=2) + "\n", encoding="utf-8")
 
         # Tentative status; render_step will overwrite to FAIL if render breaks.
@@ -1791,7 +1799,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-dir", required=True, type=Path)
     parser.add_argument("--json-dir", required=True, type=Path)
     parser.add_argument("--image-tsv", required=True, type=Path)
-    parser.add_argument("--image-cache-dir", default="outputs/image_cache", type=Path)
+    parser.add_argument("--image-cache-dir", default="output/samples/image_cache", type=Path)
     parser.add_argument("--style", required=True, type=Path)
     parser.add_argument("--timeline-config", required=True, type=Path)
     parser.add_argument("--ass-dir", required=True, type=Path)
@@ -1893,6 +1901,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebuild-tsv-index", action="store_true", help="Force rebuild of the TSV index even if it is up to date.")
     parser.add_argument("--force-ass", action="store_true")
     parser.add_argument("--force-trim", action="store_true")
+    parser.add_argument("--trim-tail-seconds", type=float, default=1.0,
+                        help="Seconds to trim off the end of each source video before "
+                             "stitching (default 1.0). Pass 0 to keep the last second.")
+    parser.add_argument("--no-trim-tail", dest="trim_tail_seconds", action="store_const",
+                        const=0.0,
+                        help="Shortcut for --trim-tail-seconds 0; do not trim the last second.")
     parser.add_argument("--force-render", action="store_true", help="Re-render items even if the stitched output video already exists.")
     parser.add_argument("--force-rebuild-timeline", action="store_true", help="Rebuild timeline + clean ASS + tag windows even if <ITM>.clean.json already exists.")
     parser.add_argument("--skip-render", action="store_true")
