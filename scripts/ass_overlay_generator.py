@@ -1443,9 +1443,10 @@ def _dedup_window_tags(
     product: dict[str, Any], max_per_window: int = 2
 ) -> dict[tuple[int, float], list[tuple[str, str]]]:
     """Assign each tag window up to max_per_window display tags, never
-    repeating an attribute name across the product's windows (scripts 1 and 2
-    combined). Windows are processed in playback order; a window whose valid
-    attributes were all shown by earlier windows simply gets none.
+    repeating an attribute name within the same video's windows (repeats
+    across videos are fine — each script covers its own ground). Windows are
+    processed in playback order; a window whose valid attributes were all
+    shown by an earlier window of the same video simply gets none.
 
     Computed from product data alone so every per-scene call sees the same
     assignment.
@@ -1454,10 +1455,12 @@ def _dedup_window_tags(
         product.get("tag_windows", []) or [],
         key=lambda w: (int(w.get("video_index", 0)), float(w.get("start_sec", 0.0))),
     )
-    used_names: set[str] = set()
+    used_names_by_video: dict[int, set[str]] = {}
     assigned: dict[tuple[int, float], list[tuple[str, str]]] = {}
     for w in windows:
-        key = (int(w.get("video_index", 0)), float(w.get("start_sec", 0.0)))
+        video_index = int(w.get("video_index", 0))
+        key = (video_index, float(w.get("start_sec", 0.0)))
+        used_names = used_names_by_video.setdefault(video_index, set())
         picked: list[tuple[str, str]] = []
         for tag in w.get("tags", []):
             if len(picked) >= max_per_window:
