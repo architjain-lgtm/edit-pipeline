@@ -65,6 +65,7 @@ from verify_ass_against_script import (  # noqa: E402
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 IMAGE_PICKER_URL = "http://10.12.46.8:8084/image_picker_triplet"
+ARTIFACT_URL = "http://10.12.46.7:30080/artifacts/{artifact_id}/file?tenant_id=Flipkart"
 TSV_PROGRESS_EVERY_ROWS = 100_000
 
 
@@ -117,6 +118,7 @@ REPORT_FIELDS = [
     "output_video_path",
     "time_tsv_index_load_s",
     "time_image_picker_s",
+    "time_video_download_s",
     "time_trim_s",
     "time_ass_s",
     "time_ass_script1_s",
@@ -363,6 +365,8 @@ class PipelineContext:
     ass_semaphore: threading.Semaphore
     ass_pool: Any = None  # WhisperXWorkerPool | StableTsWorkerPool | None
     tsv_index_load_s: float = 0.0
+    # item_id -> {script_index: artifact_id}; videos downloaded on demand in prepare_item
+    artifact_map: dict[str, dict[int, str]] = field(default_factory=dict)
 
 
 def repo_path(path: Path | str | None) -> str:
@@ -450,6 +454,71 @@ def discover_batch_items(batch_dir: Path) -> tuple[list[DiscoveredItem], dict[st
     ]
     complete.sort(key=lambda item: item.first_seen)
     return complete, pairs
+
+
+def download_artifact(artifact_id: str, dest: Path) -> None:
+    if dest.exists() and dest.stat().st_size > 0:
+        return
+    url = ARTIFACT_URL.format(artifact_id=artifact_id)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    with urllib.request.urlopen(url, timeout=120) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} for {url}")
+        with tmp.open("wb") as handle:
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                handle.write(chunk)
+    tmp.replace(dest)
+
+
+def merge_manifest_items(
+    manifest_path: Path,
+    batch_dir: Path,
+    complete: list[DiscoveredItem],
+    all_pairs: dict[str, dict[int, BatchVideo]],
+) -> dict[str, dict[int, str]]:
+    """Add manifest items whose videos are not on disk yet; return the artifact map.
+
+    Manifest rows come from bgm_explainer_pipeline.py: {item_id, slug,
+    video_artifact_script1, video_artifact_script2, ...}. Videos for these items
+    are downloaded on demand inside prepare_item, so the run does not wait for a
+    bulk download before starting.
+    """
+    artifact_map: dict[str, dict[int, str]] = {}
+    added = 0
+    offset = 1_000_000  # keep disk-discovered items first in first_seen order
+    with manifest_path.open("r", encoding="utf-8") as handle:
+        for index, line in enumerate(handle):
+            line = line.strip()
+            if not line:
+                continue
+            rec = json.loads(line)
+            item_id = rec.get("item_id")
+            aid1 = rec.get("video_artifact_script1")
+            aid2 = rec.get("video_artifact_script2")
+            if not item_id or not aid1 or not aid2:
+                continue
+            artifact_map[item_id] = {1: aid1, 2: aid2}
+            existing = all_pairs.get(item_id)
+            if existing and 1 in existing and 2 in existing:
+                continue
+            slug = rec.get("slug") or "Product"
+            pair = {
+                si: BatchVideo(
+                    item_id, si, slug,
+                    batch_dir / f"{item_id}_{slug}_script{si}_{slug}.mp4",
+                )
+                for si in (1, 2)
+            }
+            all_pairs[item_id] = pair
+            complete.append(DiscoveredItem(item_id=item_id, pair=pair, first_seen=offset + index))
+            added += 1
+    if added:
+        print(f"Manifest added {added} item(s) pending video download.", flush=True)
+    return artifact_map
 
 
 def select_items(
@@ -1451,6 +1520,16 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
         if 1 not in pair or 2 not in pair:
             raise RuntimeError("missing pair")
 
+        artifact_ids = ctx.artifact_map.get(item_id)
+        if artifact_ids:
+            _t_download = time.monotonic()
+            for script_index in (1, 2):
+                video = pair[script_index]
+                artifact_id = artifact_ids.get(script_index)
+                if artifact_id and not (video.path.exists() and video.path.stat().st_size > 0):
+                    download_artifact(artifact_id, video.path)
+            row["time_video_download_s"] = round(time.monotonic() - _t_download, 2)
+
         script_record = ctx.script_records.get(item_id)
         if script_record is None or script_record.record is None:
             raise RuntimeError(script_record.error if script_record else "missing script record")
@@ -1912,6 +1991,10 @@ def parse_args() -> argparse.Namespace:
         help="Full stable-ts command template using {input} and {output}, overriding --stable-ts-cmd/--stable-ts-arg.",
     )
     parser.add_argument("--itm-list", help="Allowlist as comma-separated ITMs or a text file path.")
+    parser.add_argument("--manifest-jsonl", type=Path, default=None,
+                        help="Manifest from bgm_explainer_pipeline.py; items listed there are "
+                             "processed even if their videos are not in --batch-dir yet — the "
+                             "videos are downloaded from the artifacts service during the run.")
     parser.add_argument("--expected-images", default=None, type=positive_int)
     parser.add_argument("--scan-full-tsv", action="store_true")
     parser.add_argument(
@@ -1985,6 +2068,15 @@ def main() -> int:
 
     allowlist = parse_itm_list(args.itm_list)
     complete, all_pairs = discover_batch_items(args.batch_dir)
+
+    artifact_map: dict[str, dict[int, str]] = {}
+    if args.manifest_jsonl:
+        manifest_path = resolve_existing_path(args.manifest_jsonl)
+        if not manifest_path.exists():
+            print(f"ERROR: --manifest-jsonl does not exist: {manifest_path}", file=sys.stderr)
+            return 2
+        artifact_map = merge_manifest_items(manifest_path, args.batch_dir, complete, all_pairs)
+        complete.sort(key=lambda item: item.first_seen)
 
     if not args.force_render:
         kept: list[DiscoveredItem] = []
@@ -2097,6 +2189,7 @@ def main() -> int:
         ass_semaphore=threading.Semaphore(n_workers),
         ass_pool=ass_pool,
         tsv_index_load_s=tsv_index_load_s,
+        artifact_map=artifact_map,
     )
 
     rows_by_id: dict[str, dict[str, Any]] = {}
