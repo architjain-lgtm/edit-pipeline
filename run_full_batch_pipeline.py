@@ -66,6 +66,8 @@ from verify_ass_against_script import (  # noqa: E402
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 IMAGE_PICKER_URL = "http://10.12.46.8:8084/image_picker_triplet"
 ARTIFACT_URL = "http://10.12.46.7:30080/artifacts/{artifact_id}/file?tenant_id=Flipkart"
+_CLUSTER_URL_RE = re.compile(r"http://artifacts-service\.applications\.svc\.cluster\.local:\d+(/.*)")
+
 TSV_PROGRESS_EVERY_ROWS = 100_000
 
 
@@ -365,7 +367,8 @@ class PipelineContext:
     ass_semaphore: threading.Semaphore
     ass_pool: Any = None  # WhisperXWorkerPool | StableTsWorkerPool | None
     tsv_index_load_s: float = 0.0
-    # item_id -> {script_index: artifact_id}; videos downloaded on demand in prepare_item
+    # item_id -> {script_index: video source}; a source is a full download_url or
+    # an artifact_id (see download_video_source). Videos download on demand in prepare_item.
     artifact_map: dict[str, dict[int, str]] = field(default_factory=dict)
 
 
@@ -456,10 +459,27 @@ def discover_batch_items(batch_dir: Path) -> tuple[list[DiscoveredItem], dict[st
     return complete, pairs
 
 
+def download_video_source(source: str, dest: Path) -> None:
+    """Download a video to dest from either a full URL or an artifact_id.
+
+    `source` is a full http(s) URL (e.g. product_data.metadata.download_url) when
+    it starts with "http"; otherwise it is treated as an artifact_id and expanded
+    via ARTIFACT_URL.
+    """
+    url = source if source.startswith("http") else ARTIFACT_URL.format(artifact_id=source)
+    m = _CLUSTER_URL_RE.match(url)
+    if m:
+        url = f"http://10.12.46.7:30080{m.group(1)}"
+    _download_url(url, dest)
+
+
 def download_artifact(artifact_id: str, dest: Path) -> None:
+    _download_url(ARTIFACT_URL.format(artifact_id=artifact_id), dest)
+
+
+def _download_url(url: str, dest: Path) -> None:
     if dest.exists() and dest.stat().st_size > 0:
         return
-    url = ARTIFACT_URL.format(artifact_id=artifact_id)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     with urllib.request.urlopen(url, timeout=120) as resp:
@@ -502,11 +522,12 @@ def merge_manifest_items(
                 continue
             rec = json.loads(line)
             item_id = rec.get("item_id")
-            aid1 = rec.get("video_artifact_script1")
-            aid2 = rec.get("video_artifact_script2")
-            if not item_id or not aid1 or not aid2:
+            # Prefer a full product_data download_url; fall back to artifact_id.
+            src1 = rec.get("video_url_script1") or rec.get("video_artifact_script1")
+            src2 = rec.get("video_url_script2") or rec.get("video_artifact_script2")
+            if not item_id or not src1 or not src2:
                 continue
-            artifact_map[item_id] = {1: aid1, 2: aid2}
+            artifact_map[item_id] = {1: src1, 2: src2}
             image_urls = [url for url in (rec.get("image_urls") or []) if url]
             if image_urls:
                 record = {
@@ -1159,14 +1180,14 @@ def _call_tag_matcher_batch(
         method="POST",
     )
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        with urllib.request.urlopen(req, timeout=120) as resp:
             result = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise ApiCallError(api_url, payload_str, f"HTTP {exc.code} {exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise ApiCallError(api_url, payload_str, f"URLError: {exc.reason}") from exc
     except TimeoutError:
-        raise ApiCallError(api_url, payload_str, "timeout after 60s") from None
+        raise ApiCallError(api_url, payload_str, "timeout after 120s") from None
     except Exception as exc:  # noqa: BLE001
         raise ApiCallError(api_url, payload_str, f"{type(exc).__name__}: {exc}") from exc
     # Response: {"results": [{"script_id": 1, "tags": [...]}, ...]}
@@ -1540,14 +1561,14 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
         if 1 not in pair or 2 not in pair:
             raise RuntimeError("missing pair")
 
-        artifact_ids = ctx.artifact_map.get(item_id)
-        if artifact_ids:
+        video_sources = ctx.artifact_map.get(item_id)
+        if video_sources:
             _t_download = time.monotonic()
             for script_index in (1, 2):
                 video = pair[script_index]
-                artifact_id = artifact_ids.get(script_index)
-                if artifact_id and not (video.path.exists() and video.path.stat().st_size > 0):
-                    download_artifact(artifact_id, video.path)
+                source = video_sources.get(script_index)
+                if source and not (video.path.exists() and video.path.stat().st_size > 0):
+                    download_video_source(source, video.path)
             row["time_video_download_s"] = round(time.monotonic() - _t_download, 2)
 
         script_record = ctx.script_records.get(item_id)
@@ -1696,7 +1717,12 @@ def prepare_item(item: DiscoveredItem, ctx: PipelineContext) -> PreparedItem:
                 with ctx.print_lock:
                     print(f"  [{item_id}] tag picker skipped (--fallback-tag-picker), leaving tag_windows and bridge_points empty", flush=True)
                 return [], []
-            return fetch_tags(item_id, clean_paths, TAG_MATCHER_API_URL, attributes)
+            try:
+                return fetch_tags(item_id, clean_paths, TAG_MATCHER_API_URL, attributes)
+            except ApiCallError as exc:
+                with ctx.print_lock:
+                    print(f"  [{item_id}] tag_matcher failed ({exc}), leaving tag_windows empty", flush=True)
+                return [], []
 
         _t_phase2 = time.monotonic()
         with ThreadPoolExecutor(max_workers=2) as phase2_executor:
@@ -1932,7 +1958,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-video-dir", required=True, type=Path)
     parser.add_argument("--report-csv", required=True, type=Path)
     parser.add_argument("--report-json", required=True, type=Path)
-    parser.add_argument("--limit", default=200, type=positive_int)
+    parser.add_argument("--limit", default=100000, type=positive_int)
     parser.add_argument(
         "--parallel",
         default=5,

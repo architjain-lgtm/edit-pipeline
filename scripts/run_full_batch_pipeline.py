@@ -1042,7 +1042,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-video-dir", required=True, type=Path)
     parser.add_argument("--report-csv", required=True, type=Path)
     parser.add_argument("--report-json", required=True, type=Path)
-    parser.add_argument("--limit", default=200, type=positive_int)
+    parser.add_argument("--limit", default=100000, type=positive_int)
     parser.add_argument("--parallel", default=5, type=positive_int)
     parser.add_argument("--itm-list", help="Allowlist as comma-separated ITMs or a text file path.")
     parser.add_argument("--expected-images", default=None, type=positive_int)
