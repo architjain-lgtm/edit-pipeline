@@ -3,16 +3,16 @@
 
 Resolution — for each ITM id in --item-ids:
   * orchestrator.products      -> vertical (slug) + super_category
-  * qc_review.items            -> the two auto_qc_approved explainer rows
-                                  (tags {"role": "explainer"}), newest first
-  * orchestrator.product_data  -> script1/script2 texts via script_product_data_id
+  * orchestrator.product_data  -> the two explainer videos and their scripts:
+                                  VIDEO rows (role='explainer', download_url) bound
+                                  to SCRIPT rows (script_index 1/2) by job_id.
 
   Writes <work-dir>/manifest.jsonl and <work-dir>/scripts/scripts.jsonl.
   An existing manifest is reused unless --re-resolve is passed.
 
 Run — invokes run_full_batch_pipeline.py with --manifest-jsonl. The pipeline
-  downloads each item's two videos from the artifacts service on demand inside
-  prepare_item (no upfront bulk download); already-downloaded videos in
+  downloads each item's two videos from the product_data download_url on demand
+  inside prepare_item (no upfront bulk download); already-downloaded videos in
   <work-dir>/batch are reused. Images come from --image-tsv exactly as before.
   Any unrecognised CLI args are forwarded to the pipeline verbatim.
 
@@ -46,7 +46,6 @@ DB_PASSWORD = os.environ.get("MINIVET_DB_PASSWORD", "")
 
 ARTIFACT_URL = "http://10.12.46.7:30080/artifacts/{artifact_id}/file?tenant_id=Flipkart"
 
-EXPLAINER_TAG = '{"role": "explainer"}'
 CHUNK = 2000
 
 
@@ -129,17 +128,22 @@ def fetch_products(itm_ids: list[str]) -> dict[str, dict[str, Any]]:
                    title,
                    description,
                    product_metadata->'category'->>'analytic_vertical',
-                   product_metadata->'category'->>'analytic_super_category'
+                   product_metadata->'category'->>'analytic_super_category',
+                   product_metadata->'attributes'
             FROM public.products
             WHERE external_id = ANY(:ids)
             """,
             ids=chunk,
         )
-        for itm, uuid, title, description, vertical, sc in rows:
+        for itm, uuid, title, description, vertical, sc, pm_attrs in rows:
+            if pm_attrs and isinstance(pm_attrs, dict):
+                attributes = {k: str(v) for k, v in pm_attrs.items() if v}
+            else:
+                attributes = attributes_from_description(description or "")
             out[itm] = {
                 "product_uuid": str(uuid),
                 "title": fix_mojibake((title or "").strip()),
-                "attributes": attributes_from_description(description or ""),
+                "attributes": attributes,
                 "vertical": vertical or "",
                 "super_category": sc or "",
             }
@@ -179,62 +183,64 @@ def fetch_product_images(products: dict[str, dict[str, Any]]) -> dict[str, list[
     return out
 
 
-def fetch_approved_rows(itm_ids: list[str]) -> dict[str, list[dict[str, Any]]]:
-    """ITM -> explainer video rows (newest first, any review status) with video + script ids."""
-    out: dict[str, list[dict[str, Any]]] = {}
+def fetch_video_pairs(
+    products: dict[str, dict[str, Any]]
+) -> dict[str, dict[int, dict[str, Any]]]:
+    """ITM -> {script_index: {script_text, video_url}} from orchestrator.product_data.
+
+    For each product UUID we read its VIDEO and SCRIPT rows. A SCRIPT row carries
+    script_index (1/2) + script_text + job_id; an explainer VIDEO row carries a
+    download_url + job_id. They bind by matching job_id, so each script index gets
+    the download_url of the video produced from that script.
+    """
+    uuid_to_itm = {p["product_uuid"]: itm for itm, p in products.items()}
+    # itm -> {job_id: download_url} (explainer videos) and pending script rows
+    video_by_job: dict[str, dict[str, str]] = {}
+    out: dict[str, dict[int, dict[str, Any]]] = {}
+    pending_scripts: dict[str, dict[int, dict[str, Any]]] = {}
 
     def run_chunk(conn, chunk):
         rows = conn.run(
             """
-            SELECT product_id, item_id, item_payload
-            FROM public.items
-            WHERE product_id = ANY(:ids)
-              AND tags = CAST(:tag AS jsonb)
-              AND review_type = 'EXPLAINER_VIDEO'
-            ORDER BY product_id, item_id DESC
-            """,
-            ids=chunk,
-            tag=EXPLAINER_TAG,
-        )
-        for itm, _row_id, payload in rows:
-            if not isinstance(payload, dict):
-                continue
-            meta = payload.get("metadata") or {}
-            vid = payload.get("video_artifact_id")
-            pdi = meta.get("script_product_data_id")
-            if not vid or not pdi:
-                continue
-            out.setdefault(itm, []).append(
-                {"video_artifact_id": vid, "script_product_data_id": str(pdi)}
-            )
-
-    run_chunked("qc_review", itm_ids, run_chunk)
-    print(f"  qc rows: {len(out)} items with approved explainer rows", flush=True)
-    return out
-
-
-def fetch_scripts(pdis: list[str]) -> dict[str, dict[str, Any]]:
-    out: dict[str, dict[str, Any]] = {}
-
-    def run_chunk(conn, chunk):
-        rows = conn.run(
-            """
-            SELECT product_data_id, metadata
+            SELECT product_id, type, metadata
             FROM public.product_data
-            WHERE type = 'SCRIPT'
-              AND product_data_id = ANY(CAST(:ids AS uuid[]))
+            WHERE product_id = ANY(CAST(:ids AS uuid[]))
+              AND type IN ('VIDEO', 'SCRIPT')
             """,
             ids=chunk,
         )
-        for pdi, meta in rows:
-            meta = meta or {}
-            out[str(pdi)] = {
-                "script_text": meta.get("script_text", ""),
-                "script_index": meta.get("script_index"),
-            }
+        for puid, typ, meta in rows:
+            itm = uuid_to_itm.get(str(puid))
+            if not itm or not isinstance(meta, dict):
+                continue
+            if typ == "VIDEO":
+                if (meta.get("role") == "explainer" and meta.get("download_url")
+                        and meta.get("job_id")):
+                    video_by_job.setdefault(itm, {})[meta["job_id"]] = meta["download_url"]
+            elif typ == "SCRIPT":
+                jid, text = meta.get("job_id"), meta.get("script_text")
+                try:
+                    idx = int(meta.get("script_index"))
+                except (TypeError, ValueError):
+                    continue
+                if idx in (1, 2) and jid and text:
+                    # keep first seen per index
+                    pending_scripts.setdefault(itm, {}).setdefault(
+                        idx, {"job_id": jid, "script_text": text})
 
-    run_chunked("orchestrator", pdis, run_chunk)
-    print(f"  scripts: {len(out)} resolved", flush=True)
+    run_chunked("orchestrator", sorted(uuid_to_itm), run_chunk)
+
+    for itm, by_index in pending_scripts.items():
+        jobs = video_by_job.get(itm, {})
+        bound: dict[int, dict[str, Any]] = {}
+        for idx, info in by_index.items():
+            url = jobs.get(info["job_id"])
+            if url:
+                bound[idx] = {"script_text": info["script_text"], "video_url": url}
+        if 1 in bound and 2 in bound:
+            out[itm] = bound
+
+    print(f"  video pairs: {len(out)} items with both script videos", flush=True)
     return out
 
 
@@ -242,13 +248,10 @@ def resolve(itm_ids: list[str], manifest_path: Path) -> list[dict[str, Any]]:
     print(f"Resolving {len(itm_ids)} items from DB ...", flush=True)
     products = fetch_products(itm_ids)
     images = fetch_product_images(products)
-    approved = fetch_approved_rows(itm_ids)
-    all_pdis = sorted({r["script_product_data_id"]
-                       for rows in approved.values() for r in rows})
-    scripts = fetch_scripts(all_pdis)
+    video_pairs = fetch_video_pairs(products)
 
     records: list[dict[str, Any]] = []
-    skipped = {"no_product": 0, "no_images": 0, "lt2_rows": 0, "no_script_pair": 0}
+    skipped = {"no_product": 0, "no_images": 0, "no_video_pair": 0}
     for itm in itm_ids:
         product = products.get(itm)
         if not product:
@@ -258,27 +261,9 @@ def resolve(itm_ids: list[str], manifest_path: Path) -> list[dict[str, Any]]:
         if not image_urls:
             skipped["no_images"] += 1
             continue
-        rows = approved.get(itm) or []
-        if len(rows) < 2:
-            skipped["lt2_rows"] += 1
-            continue
-        by_index: dict[int, dict[str, Any]] = {}
-        for row in rows:  # newest first; keep first valid binding per index
-            info = scripts.get(row["script_product_data_id"])
-            if not info or not info.get("script_text"):
-                continue
-            try:
-                idx = int(info.get("script_index"))
-            except (TypeError, ValueError):
-                continue
-            if idx not in (1, 2) or idx in by_index:
-                continue
-            by_index[idx] = {
-                "video_artifact_id": row["video_artifact_id"],
-                "script_text": info["script_text"],
-            }
-        if 1 not in by_index or 2 not in by_index:
-            skipped["no_script_pair"] += 1
+        by_index = video_pairs.get(itm)
+        if not by_index or 1 not in by_index or 2 not in by_index:
+            skipped["no_video_pair"] += 1
             continue
         records.append({
             "item_id": itm,
@@ -289,8 +274,8 @@ def resolve(itm_ids: list[str], manifest_path: Path) -> list[dict[str, Any]]:
             "image_urls": image_urls,
             "script1": by_index[1]["script_text"],
             "script2": by_index[2]["script_text"],
-            "video_artifact_script1": by_index[1]["video_artifact_id"],
-            "video_artifact_script2": by_index[2]["video_artifact_id"],
+            "video_url_script1": by_index[1]["video_url"],
+            "video_url_script2": by_index[2]["video_url"],
         })
 
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
